@@ -4,7 +4,7 @@ description = "A small Typst-native starter for static sites"
 template = "base.typ"
 ---
 
-#import "@local/typage-theme:0.1.0": callout, card
+#import "@local/typage-theme:0.1.1": callout, card
 
 Typage is an experimental SSG that lets you write content, templates, and theme components in Typst, then publish static HTML.
 

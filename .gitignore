@@ -1,0 +1,42 @@
+# Rust build output
+/target/
+
+# Typage generated output and local cache
+/.typage/
+/public/
+/dist/
+/sample/.typage/
+/sample/public/
+/sample/dist/
+/r-portfolio-typage/.typage/
+/r-portfolio-typage/dist/
+
+# Hosting provider local state
+/.vercel/
+/.netlify/
+/.wrangler/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+*.bak
+*.orig
+
+# Coverage and profiling output
+/coverage/
+/tarpaulin-report.html
+*.profraw
+
+# Editor and OS files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/

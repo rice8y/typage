@@ -1,0 +1,63 @@
+title = "Typage"
+base_url = ""
+lang = "en"
+typst = "typst"
+content_dir = "content"
+templates_dir = "templates"
+static_dir = "static"
+out_dir = "public"
+# Optional URL pattern. Placeholders: :section, :slug, :path, :filename, :year, :month, :day
+# permalink = "/:section/:slug/"
+cache_dir = ".typage"
+default_template = "base.typ"
+list_template = "list.typ"
+features = "html"
+bundle_features = "bundle,html"
+build_pdf = false
+build_future = false
+build_expired = false
+fail_on_broken_links = true
+paginate_by = 10
+feed = false
+# feed_path = "feed.xml"
+# feed_sections = ["posts"]
+# feed_limit = 20 # 0 = unlimited
+# atom_feed = true
+sitemap = false
+robots = false
+jobs = 0 # 0 = auto
+# Start without taxonomies. Add [[taxonomies]] entries when needed.
+taxonomies = []
+
+# Keep the starter minimal. Enable search when you add a search page.
+[search]
+enabled = false
+mode = "auto"      # auto | latin | cjk | ngram | ngram-only
+ngram = 2
+include_body = true
+include_headings = true
+include_tags = true
+include_taxonomies = true
+compact = false
+max_tokens = 2048
+
+[extra]
+description = "A Typst-native static site"
+
+[scripts]
+build = "build"
+dev = "serve --live-reload"
+preview = "serve"
+check = "doctor"
+clean = "clean"
+deploy-check = "deploy doctor"
+
+[hooks]
+# Hooks run from the site root. They may call external commands or `typage ...`.
+# Nested typage commands run from hooks do not trigger hooks again.
+# pre_build = "echo before build"
+# post_build = "echo after build"
+# pre_serve = "echo before serve"
+# post_serve = "echo after serve"
+# pre_deploy = "echo before deploy"
+# post_deploy = "echo after deploy"

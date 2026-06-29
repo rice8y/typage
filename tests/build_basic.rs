@@ -3,11 +3,36 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn typst_available() -> bool {
-    Command::new("typst")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    let out = match Command::new("typst").arg("--version").output() {
+        Ok(out) if out.status.success() => out,
+        _ => return false,
+    };
+    let version = String::from_utf8(out.stdout)
+        .ok()
+        .and_then(|s| parse_typst_version(&s));
+    matches!(version, Some(version) if version >= (0, 15, 0))
+}
+
+fn parse_typst_version(output: &str) -> Option<(u64, u64, u64)> {
+    output.split_whitespace().find_map(|token| {
+        let token = token.strip_prefix('v').unwrap_or(token);
+        let mut parts = token.split('.');
+        let major = parse_version_component(parts.next()?)?;
+        let minor = parse_version_component(parts.next()?)?;
+        let patch = parse_version_component(parts.next()?)?;
+        Some((major, minor, patch))
+    })
+}
+
+fn parse_version_component(component: &str) -> Option<u64> {
+    let digits = component
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse().ok()
 }
 
 fn temp_project(name: &str) -> PathBuf {

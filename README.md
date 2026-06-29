@@ -1,8 +1,24 @@
-# typage
+# Typage
 
 Typage is an experimental static site generator written in Rust and powered by Typst HTML Export.
 
 The goal is to combine the safety and predictable output model of tools like Zola or Jekyll with a Typst-native authoring and templating experience.
+
+## Experimental Status
+
+Typage depends on Typst's HTML export, which is currently under active development and still incomplete. Typst HTML export is available only for experimentation behind a feature flag.
+
+**Do not use Typage or Typst HTML export for production use cases.** Expect breaking changes, missing HTML features, and output changes as Typst's exporter evolves.
+
+In the Typst CLI, HTML export can be enabled with `--features html` or `TYPST_FEATURES=html`. HTML export is not available in the Typst web app at this time. Follow Typst's [HTML export tracking issue](https://github.com/typst/typst/issues/5512) for upstream progress and planned features.
+
+## Requirements
+
+- Rust and Cargo are required to install or build `typage`.
+- Typst CLI 0.15.0 or later is required.
+- HTML builds require Typst's experimental HTML export. Typage enables it through `features = "html"` by default.
+- `typage bundle` requires Typst's experimental Bundle Export, which is only available in Typst 0.15.0 or later. Typage enables it through `bundle_features = "bundle,html"` by default.
+- Typage currently shells out to the Typst CLI. The Typst web app cannot be used as the compiler backend.
 
 ## Philosophy
 
@@ -592,28 +608,16 @@ Because `public/` is disposable, files that must appear in deployed output are w
 
 If a scaffold already exists, Typage refuses to overwrite it. Use `--force` when you intentionally want to regenerate it.
 
-The generated GitHub Pages workflow and Vercel scaffold assume `typage` is installable with `cargo install typage --locked`. During local development, adjust that line to `cargo install --path .` or `cargo install --git <repo>` as needed.
-
-## Crates.io Release
-
-Before publishing, verify the crate package from a clean working tree:
-
-```sh
-cargo test
-cargo package --allow-dirty
-cargo publish --dry-run --allow-dirty
-```
-
-When the dry run succeeds, publish with:
-
-```sh
-cargo publish
-```
-
-`Cargo.lock` is included so deployment scaffolds can use `cargo install typage --locked`.
+The generated GitHub Pages workflow and Vercel scaffold assume `typage` is installable with `cargo install typage --locked`. During local development, adjust that line to `cargo install --path .` or `cargo install --git https://github.com/rice8y/typage` as needed.
 
 ## Notes
 
 `@local/typage:0.1.0` and `@local/typage-theme:0.1.0` are staged under `.typage/packages/local/` and passed to Typst with `--package-path`.
 
 Typst HTML Export and Bundle Export are experimental. Typage is designed with that moving target in mind.
+
+## License
+
+Typage is licensed under the MIT License. See [LICENSE](LICENSE) for details.
+
+Dependencies are governed by their own licenses.

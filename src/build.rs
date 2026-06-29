@@ -23,6 +23,9 @@ use crate::util::{
     typst_tuple, write_if_changed,
 };
 
+const MIN_TYPST_VERSION: (u64, u64, u64) = (0, 15, 0);
+const MIN_TYPST_VERSION_DISPLAY: &str = "0.15.0";
+
 #[derive(Debug, Clone)]
 pub struct BuildOptions {
     pub root: PathBuf,
@@ -733,22 +736,11 @@ pub fn doctor(root: PathBuf, typst_override: Option<String>, drafts: bool) -> Re
 
     println!("root: {}", root.display());
     println!("config: {}", root.join("config.toml").display());
-    match Command::new(&cfg.typst).arg("--version").output() {
-        Ok(out) if out.status.success() => {
-            let version = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            println!("typst: ok ({version})");
+    match check_typst_requirement(&cfg.typst) {
+        Ok(version) => {
+            println!("typst: ok ({version}; requires {MIN_TYPST_VERSION_DISPLAY} or later)")
         }
-        Ok(out) => {
-            errors.push(format!(
-                "typst command exited with {}: {}",
-                out.status,
-                String::from_utf8_lossy(&out.stderr)
-            ));
-        }
-        Err(err) => errors.push(format!(
-            "failed to run typst command {:?}: {err}",
-            cfg.typst
-        )),
+        Err(err) => errors.push(err.to_string()),
     }
     for (name, path) in [("content", &content_root), ("templates", &templates_root)] {
         if path.exists() {
@@ -876,6 +868,54 @@ pub fn doctor(root: PathBuf, typst_override: Option<String>, drafts: bool) -> Re
     }
 }
 
+fn check_typst_requirement(typst: &str) -> Result<String> {
+    let out = Command::new(typst)
+        .arg("--version")
+        .output()
+        .with_context(|| format!("failed to run typst command {typst:?}"))?;
+    if !out.status.success() {
+        bail!(
+            "typst command exited with {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    let reported = if stdout.is_empty() { &stderr } else { &stdout };
+    let version = parse_typst_version(reported).ok_or_else(|| {
+        anyhow::anyhow!("failed to parse typst version from output: {reported:?}")
+    })?;
+    if version < MIN_TYPST_VERSION {
+        bail!(
+            "Typst {MIN_TYPST_VERSION_DISPLAY} or later is required; found {reported}. Typage uses Typst HTML export and bundle export features."
+        );
+    }
+    Ok(reported.to_string())
+}
+
+fn parse_typst_version(output: &str) -> Option<(u64, u64, u64)> {
+    output.split_whitespace().find_map(|token| {
+        let token = token.strip_prefix('v').unwrap_or(token);
+        let mut parts = token.split('.');
+        let major = parse_version_component(parts.next()?)?;
+        let minor = parse_version_component(parts.next()?)?;
+        let patch = parse_version_component(parts.next()?)?;
+        Some((major, minor, patch))
+    })
+}
+
+fn parse_version_component(component: &str) -> Option<u64> {
+    let digits = component
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse().ok()
+}
+
 fn validate_relative_content_path(path: &Path) -> Result<()> {
     for component in path.components() {
         match component {
@@ -947,6 +987,7 @@ pub fn build_site(opts: &BuildOptions) -> Result<BuildStats> {
     if let Some(typst) = &opts.typst_override {
         cfg.typst = typst.clone();
     }
+    check_typst_requirement(&cfg.typst)?;
     let started = Instant::now();
     let cfg_hash_str = cfg_hash(&cfg);
     let mut template_hashes = BTreeMap::<String, String>::new();
@@ -1232,6 +1273,7 @@ pub fn bundle_site(root: PathBuf, drafts: bool, typst_override: Option<String>) 
     if let Some(typst) = typst_override {
         cfg.typst = typst;
     }
+    check_typst_requirement(&cfg.typst)?;
     let content_root = root.join(&cfg.content_dir);
     let out_root = root.join(&cfg.out_dir);
     let cache_root = root.join(&cfg.cache_dir);
@@ -4380,6 +4422,16 @@ mod tests {
     use super::*;
     use crate::config::{Config, FeedConfig};
     use std::path::Path;
+
+    #[test]
+    fn parses_typst_versions() {
+        assert_eq!(
+            parse_typst_version("typst 0.15.0 (unknown commit)"),
+            Some((0, 15, 0))
+        );
+        assert_eq!(parse_typst_version("typst v0.16.1-dev"), Some((0, 16, 1)));
+        assert_eq!(parse_typst_version("typst unknown"), None);
+    }
 
     fn page_summary(title: &str, url: &str, section: &str, date: &str) -> PageSummary {
         PageSummary {

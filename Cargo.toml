@@ -3,7 +3,7 @@ name = "typage"
 version = "0.1.0"
 edition = "2021"
 description = "A Rust static site generator powered by Typst HTML Export"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 readme = "README.md"
 homepage = "https://github.com/rice8y/typage"
 repository = "https://github.com/rice8y/typage"
@@ -13,8 +13,7 @@ include = [
   "/Cargo.toml",
   "/Cargo.lock",
   "/README.md",
-  "/LICENSE-MIT",
-  "/LICENSE-APACHE",
+  "/LICENSE",
   "/src/**",
   "/tests/**",
   "/config.toml",

@@ -56,7 +56,7 @@ In the Typst CLI, HTML export can be enabled with `--features html` or `TYPST_FE
 - Optional RSS, Atom, sitemap, and robots outputs.
 - Canonical URL, Open Graph, and Twitter Card metadata in default templates.
 - Full-text `search_index.json` with field scores, heading entries, and CJK-friendly tokenization.
-- Theme-owned Typst components through `@local/typage-theme:0.1.1`.
+- Theme-owned Typst components through `@local/typage-theme:0.1.2`.
 - Built-in shortcodes: `note`, `figure`, and `youtube`.
 - `serve --live-reload`.
 - Threaded development server with read/write timeouts.
@@ -68,7 +68,7 @@ In the Typst CLI, HTML export can be enabled with `--features html` or `TYPST_FE
 - `doctor`, `new`, `theme new`, `theme list --verbose`, `theme info`, and `theme check`.
 - Deployment scaffolds for GitHub Pages, Cloudflare Pages, Netlify, and Vercel.
 - `run` scripts plus `dev`, `preview`, and `check` aliases.
-- Generated local Typst packages `@local/typage:0.1.1` and `@local/typage-theme:0.1.1`.
+- Generated local Typst packages `@local/typage:0.1.2` and `@local/typage-theme:0.1.2`.
 - Section-local previous and next navigation.
 - HTML/PDF dual-target helpers using `context { ... target() ... }`.
 - Unit tests plus a Typst-backed integration test when `typst` is available.
@@ -188,7 +188,7 @@ Nested directories become nested sections. For example, `content/posts/tutorials
 The generated site package exposes section data:
 
 ```typst
-#import "@local/typage:0.1.1": current, section, children, ancestors, siblings
+#import "@local/typage:0.1.2": current, section, children, ancestors, siblings
 
 #current.updated
 #current.weight
@@ -261,13 +261,13 @@ Components are theme-owned. The SSG core only exposes data, routing, URL helpers
 Use the core package for site data:
 
 ```typst
-#import "@local/typage:0.1.1": site, current, section, taxonomy-url
+#import "@local/typage:0.1.2": site, current, section, taxonomy-url
 ```
 
 Use the active theme package for UI components:
 
 ```typst
-#import "@local/typage-theme:0.1.1": note, callout, card, fig, youtube, page-link, taxonomy-link
+#import "@local/typage-theme:0.1.2": note, callout, card, fig, youtube, page-link, taxonomy-link
 
 #note(title: "Note")[
   This component comes from the active theme.
@@ -318,7 +318,7 @@ theme = "my-theme"
 name = "my-theme"
 version = "0.1.0"
 description = "A typage theme."
-min_typage = "0.1.1"
+min_typage = "0.1.2"
 
 [components]
 note = true
@@ -347,22 +347,22 @@ Component convention:
 
 ```text
 templates/components/
-|-- lib.typ       # entrypoint for @local/typage-theme:0.1.1
+|-- lib.typ       # entrypoint for @local/typage-theme:0.1.2
 |-- callout.typ
 |-- card.typ
 |-- media.typ
 `-- layout.typ
 ```
 
-`typage` copies the active `templates/components/` directory into the generated package `@local/typage-theme:0.1.1`. Project `static/` overrides theme `static/` when both provide the same path.
+`typage` copies the active `templates/components/` directory into the generated package `@local/typage-theme:0.1.2`. Project `static/` overrides theme `static/` when both provide the same path.
 
 ## Site API
 
-`@local/typage:0.1.1` exposes data and non-presentational helpers for content and templates:
+`@local/typage:0.1.2` exposes data and non-presentational helpers for content and templates:
 
 ```typst
-#import "@local/typage:0.1.1": site, current, pages, sections, taxonomies, url, asset, section, children, ancestors, siblings, taxonomy-url, is-current, page-by-url
-#import "@local/typage-theme:0.1.1": page-link, taxonomy-link
+#import "@local/typage:0.1.2": site, current, pages, sections, taxonomies, url, asset, section, children, ancestors, siblings, taxonomy-url, is-current, page-by-url
+#import "@local/typage-theme:0.1.2": page-link, taxonomy-link
 
 = #current.title
 
@@ -387,7 +387,7 @@ taxonomy-url(name, term)
 is-current(page)
 ```
 
-Presentational helpers such as `page-link`, `taxonomy-link`, `note`, `card`, and media embeds belong to `@local/typage-theme:0.1.1`.
+Presentational helpers such as `page-link`, `taxonomy-link`, `note`, `card`, and media embeds belong to `@local/typage-theme:0.1.2`.
 
 ## Directory Policy
 
@@ -660,7 +660,7 @@ During local development, adjust `cargo install typage --locked` to `cargo insta
 
 ## Notes
 
-`@local/typage:0.1.1` and `@local/typage-theme:0.1.1` are staged under `.typage/packages/local/` and passed to Typst with `--package-path`.
+`@local/typage:0.1.2` and `@local/typage-theme:0.1.2` are staged under `.typage/packages/local/` and passed to Typst with `--package-path`.
 
 Typst HTML Export and Bundle Export are experimental. Typage is designed with that moving target in mind.
 

@@ -10,11 +10,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use typst_syntax::ast::{self, AstNode};
+use typst_syntax::{is_ident, LinkedNode};
 
 use crate::config::{load_config, Config, FeedConfig, SearchConfig};
 use crate::model::{
-    BuildCache, BuildStats, CacheEntry, FrontMatter, GeneratedPage, Page, PageSummary, SkipStats,
-    TocItem,
+    BuildCache, BuildStats, CacheEntry, FrontMatter, GeneratedPage, MetadataField, Page,
+    PageSummary, SkipStats, TocItem,
 };
 use crate::term;
 use crate::util::{
@@ -66,6 +68,42 @@ impl ThemeReport {
     fn ok(&self) -> bool {
         self.errors.is_empty()
     }
+}
+
+#[derive(Debug, Clone, Default)]
+struct ContentCollections {
+    collections: BTreeMap<String, CollectionSchema>,
+}
+
+impl ContentCollections {
+    fn schema_for(&self, section: &str) -> Option<&CollectionSchema> {
+        self.collections.get(section).or_else(|| {
+            section
+                .split('/')
+                .next()
+                .and_then(|name| self.collections.get(name))
+        })
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct CollectionSchema {
+    fields: BTreeMap<String, MetadataFieldSchema>,
+}
+
+#[derive(Debug, Clone)]
+struct MetadataFieldSchema {
+    optional: bool,
+    kind: MetadataFieldKind,
+}
+
+#[derive(Debug, Clone)]
+enum MetadataFieldKind {
+    Builtin(String),
+    Array(Box<MetadataFieldSchema>),
+    Object(BTreeMap<String, MetadataFieldSchema>),
+    Union(Vec<MetadataFieldSchema>),
+    Any,
 }
 
 #[derive(Debug, Clone)]
@@ -130,6 +168,10 @@ pub fn init_project(root: &Path) -> Result<()> {
     write_if_missing(
         root.join("content/index.typ"),
         include_str!("../content/index.typ"),
+    )?;
+    write_if_missing(
+        root.join("content/config.typ"),
+        include_str!("../content/config.typ"),
     )?;
     write_if_missing(
         root.join("content/about.typ"),
@@ -701,16 +743,16 @@ pub fn new_page(
     }
     let title = title.unwrap_or_else(|| default_title(&path));
     let mut fm = String::new();
-    fm.push_str("---\n");
-    fm.push_str(&format!("title = {}\n", toml_string(&title)));
+    fm.push_str("#show: page.with(\n");
+    fm.push_str(&format!("  title: {},\n", typst_string(&title)));
     if let Some(date) = date {
-        fm.push_str(&format!("date = {}\n", toml_string(&date)));
+        fm.push_str(&format!("  date: {},\n", typst_string(&date)));
     }
     if draft {
-        fm.push_str("draft = true\n");
+        fm.push_str("  draft: true,\n");
     }
-    fm.push_str("tags = []\n");
-    fm.push_str("---\n\nWrite your content here.\n");
+    fm.push_str("  tags: (),\n");
+    fm.push_str(")\n\nWrite your content here.\n");
     write_if_changed(&path, &fm)?;
     println!("created {}", path.display());
     Ok(())
@@ -798,8 +840,10 @@ pub fn doctor(root: PathBuf, typst_override: Option<String>, drafts: bool) -> Re
         errors.push("base_url is empty but sitemap is enabled".to_string());
     }
 
+    let collections = load_content_collections(&content_root)?;
     let section_meta = discover_sections(&content_root)?;
-    let (mut pages, skipped) = discover_pages(&root, &cfg, &content_root, &out_root, drafts)?;
+    let (mut pages, skipped) =
+        discover_pages(&root, &cfg, &content_root, &out_root, drafts, &collections)?;
     assign_prev_next(&mut pages, &section_meta);
     let link_map = build_link_map(&pages);
     for page in &mut pages {
@@ -1023,8 +1067,16 @@ pub fn build_site(opts: &BuildOptions) -> Result<BuildStats> {
     fs::create_dir_all(&generated_root)?;
 
     let mut cache = read_cache(&cache_path)?;
+    let collections = load_content_collections(&content_root)?;
     let section_meta = discover_sections(&content_root)?;
-    let (mut pages, skipped) = discover_pages(&root, &cfg, &content_root, &out_root, opts.drafts)?;
+    let (mut pages, skipped) = discover_pages(
+        &root,
+        &cfg,
+        &content_root,
+        &out_root,
+        opts.drafts,
+        &collections,
+    )?;
     assign_prev_next(&mut pages, &section_meta);
     let link_map = build_link_map(&pages);
     for page in &mut pages {
@@ -1109,7 +1161,8 @@ pub fn build_site(opts: &BuildOptions) -> Result<BuildStats> {
             );
         }
         let wrapper_path = page_wrapper_path(&wrappers_root, page);
-        let wrapper = page_wrapper_source(&root, &cfg, &data_path, page, &wrapper_path)?;
+        let wrapper =
+            page_wrapper_source(&root, &cfg, &data_path, page, &wrapper_path, &collections)?;
         write_if_changed(&wrapper_path, &wrapper)?;
         compile_jobs.push(CompileJob {
             label: page.source.display().to_string(),
@@ -1282,8 +1335,10 @@ pub fn bundle_site(root: PathBuf, drafts: bool, typst_override: Option<String>) 
     fs::create_dir_all(&out_root)?;
     fs::create_dir_all(&cache_root)?;
 
+    let collections = load_content_collections(&content_root)?;
     let section_meta = discover_sections(&content_root)?;
-    let (mut pages, skipped) = discover_pages(&root, &cfg, &content_root, &out_root, drafts)?;
+    let (mut pages, skipped) =
+        discover_pages(&root, &cfg, &content_root, &out_root, drafts, &collections)?;
     assign_prev_next(&mut pages, &section_meta);
     let link_map = build_link_map(&pages);
     for page in &mut pages {
@@ -1325,7 +1380,7 @@ pub fn bundle_site(root: PathBuf, drafts: bool, typst_override: Option<String>) 
     let bundle_path = cache_root.join("bundle.typ");
     write_if_changed(
         &bundle_path,
-        &bundle_source(&root, &cfg, &data_path, &pages, &generated)?,
+        &bundle_source(&root, &cfg, &data_path, &pages, &generated, &collections)?,
     )?;
     let bundle_current = pages
         .first()
@@ -1363,8 +1418,8 @@ fn discover_sections(content_root: &Path) -> Result<BTreeMap<String, FrontMatter
         }
         let raw = fs::read_to_string(path)
             .with_context(|| format!("failed to read {}", path.display()))?;
-        let (meta, _) = split_frontmatter(&raw)
-            .with_context(|| format!("failed to parse front matter in {}", path.display()))?;
+        let (meta, _) = split_metadata(path, &raw)
+            .with_context(|| format!("failed to parse metadata in {}", path.display()))?;
         let parent = path.parent().unwrap_or(content_root);
         let rel = parent.strip_prefix(content_root).unwrap_or(parent);
         let section = if rel.as_os_str().is_empty() {
@@ -2220,10 +2275,13 @@ fn taxonomy_search_text(page: &Page, cfg: &SearchConfig) -> String {
         parts.extend(page.meta.categories.iter().cloned());
     }
     if cfg.include_taxonomies {
-        for (key, value) in page.meta.extra() {
+        for (key, field) in &page.meta.fields {
             if matches!(key.as_str(), "tags" | "categories") {
                 continue;
             }
+            let Some(value) = field.value.clone() else {
+                continue;
+            };
             match value {
                 toml::Value::String(s) => parts.push(s),
                 toml::Value::Array(xs) => {
@@ -2471,6 +2529,7 @@ fn discover_pages(
     content_root: &Path,
     out_root: &Path,
     drafts: bool,
+    collections: &ContentCollections,
 ) -> Result<(Vec<Page>, SkipStats)> {
     let mut pages = Vec::new();
     let mut skipped = SkipStats::default();
@@ -2486,6 +2545,9 @@ fn discover_pages(
         if !entry.file_type().is_file() || !is_typst_file(path) {
             continue;
         }
+        if path == content_root.join("config.typ") {
+            continue;
+        }
         if path.file_name() == Some(OsStr::new("_index.typ")) {
             continue;
         }
@@ -2494,8 +2556,8 @@ fn discover_pages(
         }
         let raw = fs::read_to_string(path)
             .with_context(|| format!("failed to read {}", path.display()))?;
-        let (mut meta, body) = split_frontmatter(&raw)
-            .with_context(|| format!("failed to parse front matter in {}", path.display()))?;
+        let (mut meta, body) = split_metadata(path, &raw)
+            .with_context(|| format!("failed to parse metadata in {}", path.display()))?;
         if meta.lang.as_deref().unwrap_or("").trim().is_empty() {
             meta.lang = Some(cfg.lang.clone());
         }
@@ -2514,6 +2576,7 @@ fn discover_pages(
         let rel = path.strip_prefix(content_root)?.to_path_buf();
         let title = meta.title.clone().unwrap_or_else(|| default_title(path));
         let section = meta.section.clone().unwrap_or_else(|| infer_section(&rel));
+        validate_page_metadata_schema(path, &section, &meta, collections)?;
         let address = page_address(cfg, &rel, &section, &meta)?;
         let output_html = out_root
             .join(address.url.trim_start_matches('/'))
@@ -2558,20 +2621,996 @@ fn discover_pages(
     Ok((pages, skipped))
 }
 
-fn split_frontmatter(raw: &str) -> Result<(FrontMatter, String)> {
+fn validate_page_metadata_schema(
+    path: &Path,
+    section: &str,
+    meta: &FrontMatter,
+    collections: &ContentCollections,
+) -> Result<()> {
+    let Some(schema) = collections.schema_for(section) else {
+        return Ok(());
+    };
+    for key in meta.fields.keys() {
+        if !schema.fields.contains_key(key) {
+            bail!(
+                "{}: metadata field `{key}` is not declared in collection schema `{}`",
+                path.display(),
+                section.split('/').next().unwrap_or(section)
+            );
+        }
+    }
+    for (name, field_schema) in &schema.fields {
+        let value = page_metadata_owned_value(meta, name);
+        if value.is_none() && !field_schema.optional {
+            bail!(
+                "{}: missing required metadata field `{name}` for collection `{}`",
+                path.display(),
+                section.split('/').next().unwrap_or(section)
+            );
+        }
+        if let Some(value) = value {
+            validate_toml_schema_value(path, name, &value, field_schema)?;
+        }
+    }
+    Ok(())
+}
+
+fn page_metadata_owned_value(meta: &FrontMatter, name: &str) -> Option<toml::Value> {
+    meta.fields
+        .get(name)
+        .and_then(|field| field.value.clone())
+        .or_else(|| core_metadata_owned_value(meta, name))
+}
+
+fn core_metadata_owned_value(meta: &FrontMatter, name: &str) -> Option<toml::Value> {
+    match name {
+        "title" => meta.title.clone().map(toml::Value::String),
+        "description" => meta.description.clone().map(toml::Value::String),
+        "date" => meta.date.clone().map(toml::Value::String),
+        "updated" => meta.updated.clone().map(toml::Value::String),
+        "expires" => meta.expires.clone().map(toml::Value::String),
+        "weight" => meta.weight.map(toml::Value::Integer),
+        "lang" => meta.lang.clone().map(toml::Value::String),
+        "draft" => Some(toml::Value::Boolean(meta.draft)),
+        "slug" => meta.slug.clone().map(toml::Value::String),
+        "path" | "permalink" => meta.permalink.clone().map(toml::Value::String),
+        "template" => meta.template.clone().map(toml::Value::String),
+        "section" => meta.section.clone().map(toml::Value::String),
+        "tags" => Some(toml::Value::Array(
+            meta.tags.iter().cloned().map(toml::Value::String).collect(),
+        )),
+        "categories" => Some(toml::Value::Array(
+            meta.categories
+                .iter()
+                .cloned()
+                .map(toml::Value::String)
+                .collect(),
+        )),
+        "aliases" => Some(toml::Value::Array(
+            meta.aliases
+                .iter()
+                .cloned()
+                .map(toml::Value::String)
+                .collect(),
+        )),
+        "build_pdf" => meta.build_pdf.map(toml::Value::Boolean),
+        "excerpt" => meta.excerpt.clone().map(toml::Value::String),
+        "toc" => meta.toc.map(toml::Value::Boolean),
+        "sort_by" => meta.sort_by.clone().map(toml::Value::String),
+        "paginate_by" => meta
+            .paginate_by
+            .map(|value| toml::Value::Integer(value as i64)),
+        _ => None,
+    }
+}
+
+fn validate_toml_schema_value(
+    path: &Path,
+    name: &str,
+    value: &toml::Value,
+    schema: &MetadataFieldSchema,
+) -> Result<()> {
+    if !toml_value_matches_schema(value, schema) {
+        bail!(
+            "{}: metadata field `{name}` does not match collection schema",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn toml_value_matches_schema(value: &toml::Value, schema: &MetadataFieldSchema) -> bool {
+    match &schema.kind {
+        MetadataFieldKind::Any => true,
+        MetadataFieldKind::Builtin(name) => toml_value_matches_builtin(value, name),
+        MetadataFieldKind::Array(inner) => match value {
+            toml::Value::Array(values) => values
+                .iter()
+                .all(|value| toml_value_matches_schema(value, inner)),
+            _ => false,
+        },
+        MetadataFieldKind::Object(fields) if fields.contains_key("*") => {
+            matches!(value, toml::Value::Table(_))
+        }
+        MetadataFieldKind::Object(fields) => match value {
+            toml::Value::Table(table) => fields.iter().all(|(key, field_schema)| {
+                table
+                    .get(key)
+                    .map(|value| toml_value_matches_schema(value, field_schema))
+                    .unwrap_or(field_schema.optional)
+            }),
+            _ => false,
+        },
+        MetadataFieldKind::Union(options) => options
+            .iter()
+            .any(|option| toml_value_matches_schema(value, option)),
+    }
+}
+
+fn toml_value_matches_builtin(value: &toml::Value, name: &str) -> bool {
+    match name {
+        "str" | "url" | "datetime" | "date" | "path" | "label" | "regex" | "symbol" | "version" => {
+            matches!(value, toml::Value::String(_) | toml::Value::Datetime(_))
+        }
+        "bool" => matches!(value, toml::Value::Boolean(_)),
+        "int" => matches!(value, toml::Value::Integer(_)),
+        "float" | "decimal" => matches!(value, toml::Value::Float(_)),
+        "number" => matches!(value, toml::Value::Integer(_) | toml::Value::Float(_)),
+        "array" => matches!(value, toml::Value::Array(_)),
+        "dictionary" => matches!(value, toml::Value::Table(_)),
+        _ => true,
+    }
+}
+
+#[derive(Debug)]
+struct TypstMetadataDirective {
+    range: std::ops::Range<usize>,
+    meta: FrontMatter,
+}
+
+fn split_metadata(path: &Path, raw: &str) -> Result<(FrontMatter, String)> {
     let normalized = raw.replace("\r\n", "\n");
-    let Some(rest) = normalized.strip_prefix("---\n") else {
-        return Ok((FrontMatter::default(), raw.to_string()));
+    if let Some(rest) = normalized.strip_prefix("---\n") {
+        let Some(end) = rest.find("\n---") else {
+            bail!(
+                "{}:1:1: TOML front matter starts with --- but has no closing ---",
+                path.display()
+            );
+        };
+        let fm_raw = &rest[..end];
+        let mut body_start = "---\n".len() + end + "\n---".len();
+        while normalized[body_start..].starts_with('\n') {
+            body_start += 1;
+        }
+        let body = normalized[body_start..].to_string();
+        let directives = find_typst_metadata_directives(path, &normalized, &body, body_start)?;
+        if let Some(directive) = directives.first() {
+            bail!(
+                "{}: cannot combine TOML front matter with Typst metadata directive at {}",
+                path.display(),
+                metadata_location(path, &normalized, directive.range.start)
+            );
+        }
+        let mut meta = toml::from_str::<FrontMatter>(fm_raw)
+            .with_context(|| format!("{}: failed to parse TOML front matter", path.display()))?;
+        normalize_frontmatter_fields(path, &mut meta)?;
+        apply_metadata_aliases(&mut meta);
+        return Ok((meta, body));
+    }
+
+    let directives = find_typst_metadata_directives(path, &normalized, &normalized, 0)?;
+    match directives.len() {
+        0 => Ok((FrontMatter::default(), raw.to_string())),
+        1 => {
+            let directive = directives.into_iter().next().unwrap();
+            let body = remove_metadata_directive(&normalized, directive.range);
+            let mut meta = directive.meta;
+            apply_metadata_aliases(&mut meta);
+            Ok((meta, body))
+        }
+        _ => {
+            let directive = &directives[1];
+            bail!(
+                "{}: multiple Typst metadata directives found; keep only one `#show: page.with(...)` or `#show: project.with(...)` (second at {})",
+                path.display(),
+                metadata_location(path, &normalized, directive.range.start)
+            );
+        }
+    }
+}
+
+fn normalize_frontmatter_fields(path: &Path, meta: &mut FrontMatter) -> Result<()> {
+    let flattened = std::mem::take(&mut meta.flattened_fields);
+    for (name, value) in flattened {
+        if name == "extra" {
+            bail!(
+                "{}: TOML `[extra]` is no longer supported; declare collection fields directly",
+                path.display()
+            );
+        }
+        validate_metadata_field_name(path, &name)?;
+        meta.fields.insert(
+            name,
+            MetadataField {
+                typst: typst_value(&value),
+                value: Some(value),
+            },
+        );
+    }
+    Ok(())
+}
+
+fn validate_metadata_field_name(path: &Path, name: &str) -> Result<()> {
+    if is_ident(name) {
+        Ok(())
+    } else {
+        bail!(
+            "{}: metadata field `{name}` must be a valid Typst identifier",
+            path.display()
+        );
+    }
+}
+
+fn apply_metadata_aliases(meta: &mut FrontMatter) {
+    if meta.date.is_none() {
+        meta.date = metadata_field_string(meta.fields.get("publishedDate"));
+    }
+    if meta.updated.is_none() {
+        meta.updated = metadata_field_string(meta.fields.get("updatedDate"));
+    }
+}
+
+fn metadata_field_string(field: Option<&MetadataField>) -> Option<String> {
+    match field.and_then(|field| field.value.as_ref()) {
+        Some(toml::Value::String(value)) => Some(value.clone()),
+        Some(toml::Value::Datetime(value)) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn load_content_collections(content_root: &Path) -> Result<ContentCollections> {
+    let path = content_root.join("config.typ");
+    if !path.exists() {
+        return Ok(ContentCollections::default());
+    }
+    let raw =
+        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    let root = typst_syntax::parse(&raw);
+    let linked = LinkedNode::new(&root);
+    let mut collections = None;
+    for child in linked.children() {
+        let Some(binding) = child.get().cast::<ast::LetBinding>() else {
+            continue;
+        };
+        let names = binding
+            .kind()
+            .bindings()
+            .into_iter()
+            .map(|ident| ident.as_str().to_string())
+            .collect::<Vec<_>>();
+        if !names.iter().any(|name| name == "collections") {
+            continue;
+        }
+        if collections.is_some() {
+            bail!("{}: duplicate `collections` binding", path.display());
+        }
+        let Some(init) = binding.init() else {
+            bail!("{}: `collections` must be initialized", path.display());
+        };
+        collections = Some(parse_collections_config(
+            &path,
+            &raw,
+            child.range().start,
+            init,
+        )?);
+    }
+    Ok(ContentCollections {
+        collections: collections.unwrap_or_default(),
+    })
+}
+
+fn parse_collections_config(
+    path: &Path,
+    source: &str,
+    offset: usize,
+    expr: ast::Expr,
+) -> Result<BTreeMap<String, CollectionSchema>> {
+    let mut collections = BTreeMap::new();
+    for (name, value) in metadata_dict_items(path, source, offset, "collections", expr)? {
+        validate_metadata_field_name(path, &name)?;
+        collections.insert(name, parse_collection_schema(path, source, offset, &value)?);
+    }
+    Ok(collections)
+}
+
+fn parse_collection_schema<'a>(
+    path: &Path,
+    source: &str,
+    offset: usize,
+    expr: &ast::Expr<'a>,
+) -> Result<CollectionSchema> {
+    if let ast::Expr::FuncCall(call) = expr {
+        if is_schema_function_call(*call, "collection") {
+            for arg in call.args().items() {
+                if let ast::Arg::Named(named) = arg {
+                    if named.name().as_str() == "schema" {
+                        return parse_schema_object(path, source, offset, named.expr());
+                    }
+                }
+            }
+            bail!(
+                "{}: collection.with(...) must include `schema: (...)`",
+                metadata_location(path, source, offset)
+            );
+        }
+    }
+
+    for (name, value) in metadata_dict_items(path, source, offset, "collection", *expr)? {
+        if name == "schema" {
+            return parse_schema_object(path, source, offset, value);
+        }
+    }
+    parse_schema_object(path, source, offset, *expr)
+}
+
+fn parse_schema_object<'a>(
+    path: &Path,
+    source: &str,
+    offset: usize,
+    expr: ast::Expr<'a>,
+) -> Result<CollectionSchema> {
+    let mut fields = BTreeMap::new();
+    for (name, value) in metadata_dict_items(path, source, offset, "schema", expr)? {
+        validate_metadata_field_name(path, &name)?;
+        fields.insert(name, parse_schema_field(path, source, offset, value)?);
+    }
+    Ok(CollectionSchema { fields })
+}
+
+fn parse_schema_field<'a>(
+    path: &Path,
+    source: &str,
+    offset: usize,
+    expr: ast::Expr<'a>,
+) -> Result<MetadataFieldSchema> {
+    let expr = match expr {
+        ast::Expr::Parenthesized(value) => value.expr(),
+        other => other,
     };
-    let Some(end) = rest.find("\n---") else {
-        bail!("front matter starts with --- but has no closing ---");
+    match expr {
+        ast::Expr::Ident(ident) => Ok(MetadataFieldSchema {
+            optional: false,
+            kind: schema_builtin_kind(ident.as_str()),
+        }),
+        ast::Expr::FuncCall(call) => parse_schema_call(path, source, offset, call),
+        unsupported => bail!(
+            "{}: unsupported schema expression `{}`",
+            metadata_location(path, source, offset),
+            concise_expr(unsupported)
+        ),
+    }
+}
+
+fn parse_schema_call<'a>(
+    path: &Path,
+    source: &str,
+    offset: usize,
+    call: ast::FuncCall<'a>,
+) -> Result<MetadataFieldSchema> {
+    let name = schema_call_name(call).ok_or_else(|| {
+        anyhow::anyhow!(
+            "{}: unsupported schema call",
+            metadata_location(path, source, offset)
+        )
+    })?;
+    let args = call.args().items().collect::<Vec<_>>();
+    match name {
+        "optional" => {
+            let inner = parse_single_schema_arg(path, source, offset, &args, "optional")?;
+            Ok(MetadataFieldSchema {
+                optional: true,
+                kind: inner.kind,
+            })
+        }
+        "array" => {
+            let inner = if args.is_empty() {
+                MetadataFieldSchema {
+                    optional: false,
+                    kind: MetadataFieldKind::Any,
+                }
+            } else {
+                parse_single_schema_arg(path, source, offset, &args, "array")?
+            };
+            Ok(MetadataFieldSchema {
+                optional: false,
+                kind: MetadataFieldKind::Array(Box::new(inner)),
+            })
+        }
+        "dictionary" => {
+            let inner = if args.is_empty() {
+                MetadataFieldSchema {
+                    optional: false,
+                    kind: MetadataFieldKind::Any,
+                }
+            } else {
+                parse_single_schema_arg(path, source, offset, &args, "dictionary")?
+            };
+            Ok(MetadataFieldSchema {
+                optional: false,
+                kind: MetadataFieldKind::Object(BTreeMap::from([("*".to_string(), inner)])),
+            })
+        }
+        "object" => {
+            let inner = parse_single_schema_expr(path, source, offset, &args, "object")?;
+            let object = parse_schema_object(path, source, offset, inner)?;
+            Ok(MetadataFieldSchema {
+                optional: false,
+                kind: MetadataFieldKind::Object(object.fields),
+            })
+        }
+        "union" => {
+            let mut options = Vec::new();
+            for arg in args {
+                let ast::Arg::Pos(expr) = arg else {
+                    bail!(
+                        "{}: union(...) only supports positional schema arguments",
+                        metadata_location(path, source, offset)
+                    );
+                };
+                options.push(parse_schema_field(path, source, offset, expr)?);
+            }
+            if options.is_empty() {
+                bail!(
+                    "{}: union(...) requires at least one schema argument",
+                    metadata_location(path, source, offset)
+                );
+            }
+            Ok(MetadataFieldSchema {
+                optional: false,
+                kind: MetadataFieldKind::Union(options),
+            })
+        }
+        other => Ok(MetadataFieldSchema {
+            optional: false,
+            kind: schema_builtin_kind(other),
+        }),
+    }
+}
+
+fn parse_single_schema_arg<'a>(
+    path: &Path,
+    source: &str,
+    offset: usize,
+    args: &[ast::Arg<'a>],
+    name: &str,
+) -> Result<MetadataFieldSchema> {
+    let expr = parse_single_schema_expr(path, source, offset, args, name)?;
+    parse_schema_field(path, source, offset, expr)
+}
+
+fn parse_single_schema_expr<'a>(
+    path: &Path,
+    source: &str,
+    offset: usize,
+    args: &[ast::Arg<'a>],
+    name: &str,
+) -> Result<ast::Expr<'a>> {
+    if args.len() != 1 {
+        bail!(
+            "{}: {name}(...) requires exactly one positional argument",
+            metadata_location(path, source, offset)
+        );
+    }
+    let ast::Arg::Pos(expr) = args[0] else {
+        bail!(
+            "{}: {name}(...) only supports a positional schema argument",
+            metadata_location(path, source, offset)
+        );
     };
-    let fm_raw = &rest[..end];
-    let body = rest[end + "\n---".len()..]
-        .trim_start_matches('\n')
-        .to_string();
-    let meta = toml::from_str::<FrontMatter>(fm_raw)?;
-    Ok((meta, body))
+    Ok(expr)
+}
+
+fn schema_builtin_kind(name: &str) -> MetadataFieldKind {
+    let name = match name {
+        "string" => "str",
+        "boolean" => "bool",
+        "integer" => "int",
+        other => other,
+    };
+    if name == "any" {
+        MetadataFieldKind::Any
+    } else {
+        MetadataFieldKind::Builtin(name.to_string())
+    }
+}
+
+fn schema_call_name<'a>(call: ast::FuncCall<'a>) -> Option<&'a str> {
+    match call.callee() {
+        ast::Expr::Ident(ident) => Some(ident.as_str()),
+        ast::Expr::FieldAccess(access) => Some(access.field().as_str()),
+        _ => None,
+    }
+}
+
+fn is_schema_function_call(call: ast::FuncCall, target: &str) -> bool {
+    let ast::Expr::FieldAccess(access) = call.callee() else {
+        return false;
+    };
+    if access.field().as_str() != "with" {
+        return false;
+    }
+    matches!(access.target(), ast::Expr::Ident(ident) if ident.as_str() == target)
+}
+
+fn metadata_dict_items<'a>(
+    path: &Path,
+    source: &str,
+    offset: usize,
+    context: &str,
+    expr: ast::Expr<'a>,
+) -> Result<Vec<(String, ast::Expr<'a>)>> {
+    let expr = match expr {
+        ast::Expr::Parenthesized(value) => value.expr(),
+        other => other,
+    };
+    let ast::Expr::Dict(dict) = expr else {
+        bail!(
+            "{}: `{context}` must be a dictionary",
+            metadata_location(path, source, offset)
+        );
+    };
+    let mut items = Vec::new();
+    for item in dict.items() {
+        match item {
+            ast::DictItem::Named(named) => {
+                items.push((named.name().as_str().to_string(), named.expr()));
+            }
+            ast::DictItem::Keyed(keyed) => {
+                let ast::Expr::Str(key) = keyed.key() else {
+                    bail!(
+                        "{}: `{context}` dictionary keys must be identifiers or strings",
+                        metadata_location(path, source, offset)
+                    );
+                };
+                items.push((key.get().to_string(), keyed.expr()));
+            }
+            ast::DictItem::Spread(_) => {
+                bail!(
+                    "{}: `{context}` does not support spread expressions",
+                    metadata_location(path, source, offset)
+                );
+            }
+        }
+    }
+    Ok(items)
+}
+
+fn find_typst_metadata_directives(
+    path: &Path,
+    source: &str,
+    parse_source: &str,
+    base_offset: usize,
+) -> Result<Vec<TypstMetadataDirective>> {
+    let root = typst_syntax::parse(parse_source);
+    let linked = LinkedNode::new(&root);
+    let mut directives = Vec::new();
+    for child in linked.children() {
+        let Some(show) = child.get().cast::<ast::ShowRule>() else {
+            continue;
+        };
+        let Some((name, call)) = metadata_directive_call(show) else {
+            continue;
+        };
+        let mut range = child.range().start + base_offset..child.range().end + base_offset;
+        if range.start > 0 && source.as_bytes().get(range.start - 1) == Some(&b'#') {
+            range.start -= 1;
+        }
+        let meta = frontmatter_from_metadata_call(path, source, range.start, name, call)?;
+        directives.push(TypstMetadataDirective { range, meta });
+    }
+    Ok(directives)
+}
+
+fn metadata_directive_call<'a>(show: ast::ShowRule<'a>) -> Option<(&'a str, ast::FuncCall<'a>)> {
+    if show.selector().is_some() {
+        return None;
+    }
+    let ast::Expr::FuncCall(call) = show.transform() else {
+        return None;
+    };
+    let ast::Expr::FieldAccess(access) = call.callee() else {
+        return None;
+    };
+    if access.field().as_str() != "with" {
+        return None;
+    }
+    let ast::Expr::Ident(target) = access.target() else {
+        return None;
+    };
+    match target.as_str() {
+        "page" | "project" => Some((target.as_str(), call)),
+        _ => None,
+    }
+}
+
+fn frontmatter_from_metadata_call(
+    path: &Path,
+    source: &str,
+    offset: usize,
+    directive_name: &str,
+    call: ast::FuncCall,
+) -> Result<FrontMatter> {
+    let mut meta = FrontMatter::default();
+    let mut seen = BTreeSet::new();
+    for arg in call.args().items() {
+        let ast::Arg::Named(named) = arg else {
+            bail!(
+                "{}: `{}.with(...)` metadata only supports named arguments",
+                metadata_location(path, source, offset),
+                directive_name
+            );
+        };
+        let name = named.name().as_str();
+        if !seen.insert(name.to_string()) {
+            bail!(
+                "{}: duplicate metadata argument `{name}`",
+                metadata_location(path, source, offset)
+            );
+        }
+        apply_metadata_argument(path, source, offset, &mut meta, name, named.expr())?;
+    }
+    Ok(meta)
+}
+
+fn apply_metadata_argument(
+    path: &Path,
+    source: &str,
+    offset: usize,
+    meta: &mut FrontMatter,
+    name: &str,
+    expr: ast::Expr,
+) -> Result<()> {
+    match name {
+        "title" => meta.title = metadata_optional_string(path, source, offset, name, expr)?,
+        "description" => {
+            meta.description = metadata_optional_string(path, source, offset, name, expr)?
+        }
+        "date" => meta.date = metadata_optional_string(path, source, offset, name, expr)?,
+        "updated" => meta.updated = metadata_optional_string(path, source, offset, name, expr)?,
+        "expires" => meta.expires = metadata_optional_string(path, source, offset, name, expr)?,
+        "lang" => meta.lang = metadata_optional_string(path, source, offset, name, expr)?,
+        "slug" => meta.slug = metadata_optional_string(path, source, offset, name, expr)?,
+        "path" | "permalink" => {
+            meta.permalink = metadata_optional_string(path, source, offset, name, expr)?
+        }
+        "template" => meta.template = metadata_optional_string(path, source, offset, name, expr)?,
+        "section" => meta.section = metadata_optional_string(path, source, offset, name, expr)?,
+        "excerpt" => meta.excerpt = metadata_optional_string(path, source, offset, name, expr)?,
+        "sort_by" => meta.sort_by = metadata_optional_string(path, source, offset, name, expr)?,
+        "draft" => meta.draft = metadata_bool(path, source, offset, name, expr)?.unwrap_or(false),
+        "build_pdf" => meta.build_pdf = metadata_bool(path, source, offset, name, expr)?,
+        "toc" => meta.toc = metadata_bool(path, source, offset, name, expr)?,
+        "weight" => meta.weight = metadata_i64(path, source, offset, name, expr)?,
+        "paginate_by" => meta.paginate_by = metadata_usize(path, source, offset, name, expr)?,
+        "aliases" => meta.aliases = metadata_string_array(path, source, offset, name, expr)?,
+        "tags" => meta.tags = metadata_string_array(path, source, offset, name, expr)?,
+        "categories" => meta.categories = metadata_string_array(path, source, offset, name, expr)?,
+        "extra" => bail!(
+            "{}: metadata field `extra` is not supported; declare collection fields directly",
+            metadata_location(path, source, offset)
+        ),
+        _ => {
+            meta.fields.insert(
+                name.to_string(),
+                metadata_field(path, source, offset, name, expr)?,
+            );
+        }
+    }
+    Ok(())
+}
+
+fn metadata_field(
+    path: &Path,
+    source: &str,
+    offset: usize,
+    name: &str,
+    expr: ast::Expr,
+) -> Result<MetadataField> {
+    validate_metadata_field_name(path, name)?;
+    let typst = expr.to_untyped().full_text().trim().to_string();
+    if typst.is_empty() {
+        bail!(
+            "{}: metadata field `{name}` has an empty expression",
+            metadata_location(path, source, offset)
+        );
+    }
+    let value = metadata_toml_value(path, source, offset, name, expr)
+        .ok()
+        .flatten();
+    Ok(MetadataField { typst, value })
+}
+
+fn metadata_optional_string(
+    path: &Path,
+    source: &str,
+    offset: usize,
+    name: &str,
+    expr: ast::Expr,
+) -> Result<Option<String>> {
+    match metadata_toml_value(path, source, offset, name, expr)? {
+        None => Ok(None),
+        Some(toml::Value::String(value)) => Ok(Some(value)),
+        Some(value) => bail_metadata_type(path, source, offset, name, "a string or none", &value),
+    }
+}
+
+fn metadata_bool(
+    path: &Path,
+    source: &str,
+    offset: usize,
+    name: &str,
+    expr: ast::Expr,
+) -> Result<Option<bool>> {
+    match metadata_toml_value(path, source, offset, name, expr)? {
+        None => Ok(None),
+        Some(toml::Value::Boolean(value)) => Ok(Some(value)),
+        Some(value) => bail_metadata_type(path, source, offset, name, "a boolean or none", &value),
+    }
+}
+
+fn metadata_i64(
+    path: &Path,
+    source: &str,
+    offset: usize,
+    name: &str,
+    expr: ast::Expr,
+) -> Result<Option<i64>> {
+    match metadata_toml_value(path, source, offset, name, expr)? {
+        None => Ok(None),
+        Some(toml::Value::Integer(value)) => Ok(Some(value)),
+        Some(value) => bail_metadata_type(path, source, offset, name, "an integer or none", &value),
+    }
+}
+
+fn metadata_usize(
+    path: &Path,
+    source: &str,
+    offset: usize,
+    name: &str,
+    expr: ast::Expr,
+) -> Result<Option<usize>> {
+    match metadata_i64(path, source, offset, name, expr)? {
+        None => Ok(None),
+        Some(value) if value >= 0 => Ok(Some(value as usize)),
+        Some(_) => bail!(
+            "{}: metadata field `{name}` must be a non-negative integer",
+            metadata_location(path, source, offset)
+        ),
+    }
+}
+
+fn metadata_string_array(
+    path: &Path,
+    source: &str,
+    offset: usize,
+    name: &str,
+    expr: ast::Expr,
+) -> Result<Vec<String>> {
+    match metadata_toml_value(path, source, offset, name, expr)? {
+        None => Ok(Vec::new()),
+        Some(toml::Value::Array(values)) => values
+            .into_iter()
+            .map(|value| match value {
+                toml::Value::String(value) => Ok(value),
+                other => {
+                    bail_metadata_type(path, source, offset, name, "a tuple of strings", &other)
+                }
+            })
+            .collect(),
+        Some(value) => bail_metadata_type(
+            path,
+            source,
+            offset,
+            name,
+            "a tuple of strings or none",
+            &value,
+        ),
+    }
+}
+
+fn metadata_toml_value(
+    path: &Path,
+    source: &str,
+    offset: usize,
+    name: &str,
+    expr: ast::Expr,
+) -> Result<Option<toml::Value>> {
+    Ok(match expr {
+        ast::Expr::None(_) => None,
+        ast::Expr::Parenthesized(value) => {
+            metadata_toml_value(path, source, offset, name, value.expr())?
+        }
+        ast::Expr::Str(value) => Some(toml::Value::String(value.get().to_string())),
+        ast::Expr::Bool(value) => Some(toml::Value::Boolean(value.get())),
+        ast::Expr::Int(value) => Some(toml::Value::Integer(value.get())),
+        ast::Expr::Float(value) => Some(metadata_float_value(path, source, offset, name, value.get())?),
+        ast::Expr::Unary(value) => metadata_unary_value(path, source, offset, name, value)?,
+        ast::Expr::Array(value) => {
+            let mut array = Vec::new();
+            for item in value.items() {
+                let ast::ArrayItem::Pos(expr) = item else {
+                    bail!(
+                        "{}: metadata field `{name}` does not support spread expressions in tuples",
+                        metadata_location(path, source, offset)
+                    );
+                };
+                match metadata_toml_value(path, source, offset, name, expr)? {
+                    Some(value) => array.push(value),
+                    None => bail!(
+                        "{}: metadata field `{name}` cannot contain none inside a tuple",
+                        metadata_location(path, source, offset)
+                    ),
+                }
+            }
+            Some(toml::Value::Array(array))
+        }
+        ast::Expr::Dict(value) => {
+            let mut table = toml::Table::new();
+            for item in value.items() {
+                match item {
+                    ast::DictItem::Named(named) => {
+                        if let Some(value) =
+                            metadata_toml_value(path, source, offset, name, named.expr())?
+                        {
+                            table.insert(named.name().as_str().to_string(), value);
+                        }
+                    }
+                    ast::DictItem::Keyed(keyed) => {
+                        let key = match keyed.key() {
+                            ast::Expr::Str(value) => value.get().to_string(),
+                            other => {
+                                bail!(
+                                    "{}: metadata field `{name}` only supports string dictionary keys, got `{}`",
+                                    metadata_location(path, source, offset),
+                                    concise_expr(other)
+                                );
+                            }
+                        };
+                        if let Some(value) =
+                            metadata_toml_value(path, source, offset, name, keyed.expr())?
+                        {
+                            table.insert(key, value);
+                        }
+                    }
+                    ast::DictItem::Spread(_) => {
+                        bail!(
+                            "{}: metadata field `{name}` does not support spread expressions in dictionaries",
+                            metadata_location(path, source, offset)
+                        );
+                    }
+                }
+            }
+            Some(toml::Value::Table(table))
+        }
+        unsupported => bail!(
+            "{}: unsupported metadata expression for `{name}`: `{}`; use string, boolean, number, none, tuple, or dictionary literals",
+            metadata_location(path, source, offset),
+            concise_expr(unsupported)
+        ),
+    })
+}
+
+fn metadata_unary_value(
+    path: &Path,
+    source: &str,
+    offset: usize,
+    name: &str,
+    value: ast::Unary,
+) -> Result<Option<toml::Value>> {
+    match (value.op(), value.expr()) {
+        (ast::UnOp::Pos, ast::Expr::Int(value)) => Ok(Some(toml::Value::Integer(value.get()))),
+        (ast::UnOp::Neg, ast::Expr::Int(value)) => Ok(Some(toml::Value::Integer(-value.get()))),
+        (ast::UnOp::Pos, ast::Expr::Float(value)) => {
+            Ok(Some(metadata_float_value(path, source, offset, name, value.get())?))
+        }
+        (ast::UnOp::Neg, ast::Expr::Float(value)) => {
+            Ok(Some(metadata_float_value(path, source, offset, name, -value.get())?))
+        }
+        _ => bail!(
+            "{}: unsupported metadata expression for `{name}`: `{}`; unary metadata values must be signed numbers",
+            metadata_location(path, source, offset),
+            concise_expr(ast::Expr::Unary(value))
+        ),
+    }
+}
+
+fn metadata_float_value(
+    path: &Path,
+    source: &str,
+    offset: usize,
+    name: &str,
+    value: f64,
+) -> Result<toml::Value> {
+    if value.is_finite() {
+        Ok(toml::Value::Float(value))
+    } else {
+        bail!(
+            "{}: metadata field `{name}` must be a finite float",
+            metadata_location(path, source, offset)
+        );
+    }
+}
+
+fn bail_metadata_type<T>(
+    path: &Path,
+    source: &str,
+    offset: usize,
+    name: &str,
+    expected: &str,
+    value: &toml::Value,
+) -> Result<T> {
+    bail!(
+        "{}: metadata field `{name}` must be {expected}, got {}",
+        metadata_location(path, source, offset),
+        toml_value_kind(value)
+    );
+}
+
+fn toml_value_kind(value: &toml::Value) -> &'static str {
+    match value {
+        toml::Value::String(_) => "string",
+        toml::Value::Integer(_) => "integer",
+        toml::Value::Float(_) => "float",
+        toml::Value::Boolean(_) => "boolean",
+        toml::Value::Datetime(_) => "datetime",
+        toml::Value::Array(_) => "tuple",
+        toml::Value::Table(_) => "dictionary",
+    }
+}
+
+fn concise_expr(expr: ast::Expr) -> String {
+    let text = expr.to_untyped().full_text().to_string();
+    const MAX: usize = 80;
+    if text.chars().count() <= MAX {
+        text
+    } else {
+        let mut out = text.chars().take(MAX).collect::<String>();
+        out.push_str("...");
+        out
+    }
+}
+
+fn metadata_location(path: &Path, source: &str, offset: usize) -> String {
+    let (line, column) = line_column(source, offset);
+    format!("{}:{line}:{column}", path.display())
+}
+
+fn line_column(source: &str, offset: usize) -> (usize, usize) {
+    let mut line = 1;
+    let mut column = 1;
+    for (idx, ch) in source.char_indices() {
+        if idx >= offset {
+            break;
+        }
+        if ch == '\n' {
+            line += 1;
+            column = 1;
+        } else {
+            column += 1;
+        }
+    }
+    (line, column)
+}
+
+fn remove_metadata_directive(raw: &str, range: std::ops::Range<usize>) -> String {
+    let mut end = range.end;
+    while raw[end..].starts_with('\n') {
+        end += 1;
+    }
+    let mut body = String::with_capacity(raw.len().saturating_sub(end - range.start));
+    body.push_str(&raw[..range.start]);
+    body.push_str(&raw[end..]);
+    body
 }
 
 fn is_content_partial(path: &Path) -> bool {
@@ -3259,7 +4298,7 @@ fn make_generated_pages(
                 source: String::new(),
                 excerpt: None,
                 toc: Vec::new(),
-                extra: BTreeMap::new(),
+                fields: BTreeMap::new(),
             });
             push_paginated(
                 &mut generated,
@@ -3408,7 +4447,7 @@ fn taxonomy_values(page: &PageSummary, name: &str) -> Vec<String> {
         "categories" => return page.categories.clone(),
         _ => {}
     }
-    match page.extra.get(name) {
+    match page.fields.get(name).and_then(|field| field.value.as_ref()) {
         Some(toml::Value::String(s)) => vec![s.clone()],
         Some(toml::Value::Array(xs)) => xs
             .iter()
@@ -3677,7 +4716,7 @@ fn nav_json(title: &Option<String>, url: &Option<String>) -> serde_json::Value {
 }
 
 fn page_current_json(page: &Page) -> Result<String> {
-    Ok(serde_json::to_string(&json!({
+    let mut value = json!({
         "kind": "page",
         "title": &page.title,
         "description": &page.meta.description,
@@ -3702,8 +4741,15 @@ fn page_current_json(page: &Page) -> Result<String> {
         "toc": &page.toc,
         "prev": nav_json(&page.prev_title, &page.prev_url),
         "next": nav_json(&page.next_title, &page.next_url),
-        "extra": page.meta.extra(),
-    }))?)
+    });
+    if let Some(object) = value.as_object_mut() {
+        for (name, field) in &page.meta.fields {
+            if let Some(value) = &field.value {
+                object.insert(name.clone(), serde_json::to_value(value)?);
+            }
+        }
+    }
+    Ok(serde_json::to_string(&value)?)
 }
 
 fn generated_current_json(gen: &GeneratedPage, cfg: &Config) -> Result<String> {
@@ -3731,7 +4777,6 @@ fn generated_current_json(gen: &GeneratedPage, cfg: &Config) -> Result<String> {
         "toc": [],
         "prev": nav_json(&gen.prev_title, &gen.prev_url),
         "next": nav_json(&gen.next_title, &gen.next_url),
-        "extra": {},
         "items": &gen.items,
         "page_number": gen.page_number,
         "total_pages": gen.total_pages,
@@ -3789,6 +4834,7 @@ fn page_wrapper_source(
     _data_path: &Path,
     page: &Page,
     wrapper_path: &Path,
+    collections: &ContentCollections,
 ) -> Result<String> {
     let wrapper_dir = wrapper_path.parent().unwrap_or(root);
     fs::create_dir_all(wrapper_dir)?;
@@ -3796,9 +4842,13 @@ fn page_wrapper_source(
     let template_path = templates_root(root, cfg).join(&page.template);
     let template_rel = relative_path(wrapper_dir, &template_path)?;
     let body = rewrite_local_dependency_paths(&page.processed_body, source_dir, wrapper_dir)?;
+    let current = page_dict(page);
+    let validation = page_metadata_validation_typ(page, collections);
     Ok(format!(
-        "#import {}: render\n#import \"@local/typage:{TYPAGE_VERSION}\" as typage\n\n#show: render.with(site: typage.site, page: typage.current, pages: typage.pages, taxonomies: typage.taxonomies)\n\n{}\n",
+        "#import {}: render\n#import \"@local/typage:{TYPAGE_VERSION}\" as typage\n\n#let __typage_current = {}\n{}#show: render.with(site: typage.site, page: __typage_current, pages: typage.pages, taxonomies: typage.taxonomies)\n\n{}\n",
         typst_string(&to_posix_path(&template_rel)),
+        current,
+        validation,
         body
     ))
 }
@@ -3900,7 +4950,7 @@ fn generated_wrapper_source(
 
 fn page_dict(page: &Page) -> String {
     format!(
-        "(kind: \"page\", title: {}, description: {}, excerpt: {}, date: {}, updated: {}, weight: {}, lang: {}, url: {}, canonical_url: {}, current_url: {}, slug: {}, path: {}, file_path: {}, source: {}, section: {}, parent_section: {}, ancestors: {}, tags: {}, categories: {}, aliases: {}, toc: {}, prev: {}, next: {}, extra: {})",
+        "(kind: \"page\", title: {}, description: {}, excerpt: {}, date: {}, updated: {}, weight: {}, lang: {}, url: {}, canonical_url: {}, current_url: {}, slug: {}, path: {}, file_path: {}, source: {}, section: {}, parent_section: {}, ancestors: {}, tags: {}, categories: {}, aliases: {}, toc: {}, prev: {}, next: {}{})",
         typst_string(&page.title),
         typst_opt_string(&page.meta.description),
         typst_opt_string(&page.meta.excerpt),
@@ -3924,8 +4974,186 @@ fn page_dict(page: &Page) -> String {
         toc_array(&page.toc),
         nav_dict(&page.prev_title, &page.prev_url),
         nav_dict(&page.next_title, &page.next_url),
-        typst_toml_table(&page.meta.extra()),
+        metadata_fields_typst(&page.meta.fields),
     )
+}
+
+fn page_metadata_validation_typ(page: &Page, collections: &ContentCollections) -> String {
+    let Some(schema) = collections.schema_for(&page.section) else {
+        return String::new();
+    };
+    let mut out = String::new();
+    for (idx, (name, field_schema)) in schema.fields.iter().enumerate() {
+        let var = format!("__typage_meta_{idx}");
+        out.push_str(&format!(
+            "#let {var} = __typage_current.at({}, default: none)\n",
+            typst_string(name)
+        ));
+        if !field_schema.optional {
+            out.push_str(&format!(
+                "#if {var} == none {{ panic({}) }}\n",
+                typst_string(&format!(
+                    "{}: missing required metadata field `{name}`",
+                    page.rel.display()
+                ))
+            ));
+        }
+        out.push_str(&metadata_schema_validation_typ(
+            &var,
+            name,
+            field_schema,
+            &format!("{}.{name}", page.rel.display()),
+        ));
+    }
+    out
+}
+
+fn metadata_schema_validation_typ(
+    expr: &str,
+    label: &str,
+    schema: &MetadataFieldSchema,
+    message_path: &str,
+) -> String {
+    let mut out = String::new();
+    match &schema.kind {
+        MetadataFieldKind::Any => {}
+        MetadataFieldKind::Builtin(name) => {
+            let condition = typst_type_condition(expr, name);
+            out.push_str(&format!(
+                "#if {expr} != none and not ({condition}) {{ panic({}) }}\n",
+                typst_string(&format!(
+                    "{message_path}: metadata field `{label}` must be {name}"
+                ))
+            ));
+        }
+        MetadataFieldKind::Array(inner) => {
+            out.push_str(&format!(
+                "#if {expr} != none and type({expr}) != array {{ panic({}) }}\n",
+                typst_string(&format!(
+                    "{message_path}: metadata field `{label}` must be array"
+                ))
+            ));
+            out.push_str(&format!(
+                "#if {expr} != none and type({expr}) == array {{\n"
+            ));
+            out.push_str(&format!("  for __typage_item in {expr} {{\n"));
+            let nested = metadata_schema_validation_code(
+                "__typage_item",
+                label,
+                inner,
+                &format!("{message_path}[]"),
+                "    ",
+            );
+            out.push_str(&nested);
+            out.push_str("  }\n}\n");
+        }
+        MetadataFieldKind::Object(fields) if fields.contains_key("*") => {
+            out.push_str(&format!(
+                "#if {expr} != none and type({expr}) != dictionary {{ panic({}) }}\n",
+                typst_string(&format!(
+                    "{message_path}: metadata field `{label}` must be dictionary"
+                ))
+            ));
+        }
+        MetadataFieldKind::Object(fields) => {
+            out.push_str(&format!(
+                "#if {expr} != none and type({expr}) != dictionary {{ panic({}) }}\n",
+                typst_string(&format!(
+                    "{message_path}: metadata field `{label}` must be dictionary"
+                ))
+            ));
+            out.push_str(&format!(
+                "#if {expr} != none and type({expr}) == dictionary {{\n"
+            ));
+            for (idx, (key, inner)) in fields.iter().enumerate() {
+                let var = format!("__typage_obj_{idx}");
+                out.push_str(&format!(
+                    "  let {var} = {expr}.at({}, default: none)\n",
+                    typst_string(key)
+                ));
+                if !inner.optional {
+                    out.push_str(&format!(
+                        "  if {var} == none {{ panic({}) }}\n",
+                        typst_string(&format!(
+                            "{message_path}: missing required metadata field `{label}.{key}`"
+                        ))
+                    ));
+                }
+                out.push_str(&metadata_schema_validation_code(
+                    &var,
+                    &format!("{label}.{key}"),
+                    inner,
+                    message_path,
+                    "  ",
+                ));
+            }
+            out.push_str("}\n");
+        }
+        MetadataFieldKind::Union(options) => {
+            let condition = options
+                .iter()
+                .map(|schema| metadata_schema_match_condition(expr, schema))
+                .collect::<Vec<_>>()
+                .join(" or ");
+            out.push_str(&format!(
+                "#if {expr} != none and not ({condition}) {{ panic({}) }}\n",
+                typst_string(&format!(
+                    "{message_path}: metadata field `{label}` does not match union schema"
+                ))
+            ));
+        }
+    }
+    out
+}
+
+fn metadata_schema_validation_code(
+    expr: &str,
+    label: &str,
+    schema: &MetadataFieldSchema,
+    message_path: &str,
+    indent: &str,
+) -> String {
+    metadata_schema_validation_typ(expr, label, schema, message_path)
+        .lines()
+        .map(|line| format!("{indent}{}\n", line.trim_start_matches('#')))
+        .collect::<String>()
+}
+
+fn metadata_schema_match_condition(expr: &str, schema: &MetadataFieldSchema) -> String {
+    if schema.optional {
+        return format!(
+            "{expr} == none or ({})",
+            metadata_schema_match_condition_inner(expr, schema)
+        );
+    }
+    metadata_schema_match_condition_inner(expr, schema)
+}
+
+fn metadata_schema_match_condition_inner(expr: &str, schema: &MetadataFieldSchema) -> String {
+    match &schema.kind {
+        MetadataFieldKind::Any => "true".to_string(),
+        MetadataFieldKind::Builtin(name) => typst_type_condition(expr, name),
+        MetadataFieldKind::Array(_) => format!("type({expr}) == array"),
+        MetadataFieldKind::Object(_) => format!("type({expr}) == dictionary"),
+        MetadataFieldKind::Union(options) => options
+            .iter()
+            .map(|schema| metadata_schema_match_condition(expr, schema))
+            .collect::<Vec<_>>()
+            .join(" or "),
+    }
+}
+
+fn typst_type_condition(expr: &str, name: &str) -> String {
+    match name {
+        "date" | "datetime" => format!("type({expr}) == datetime or type({expr}) == str"),
+        "url" => format!("type({expr}) == str"),
+        "number" => {
+            format!("type({expr}) == int or type({expr}) == float or type({expr}) == decimal")
+        }
+        "none" => format!("{expr} == none"),
+        "auto" => format!("{expr} == auto"),
+        other => format!("type({expr}) == {other}"),
+    }
 }
 
 fn nav_dict(title: &Option<String>, url: &Option<String>) -> String {
@@ -3942,7 +5170,7 @@ fn nav_dict(title: &Option<String>, url: &Option<String>) -> String {
 fn generated_page_dict(gen: &GeneratedPage, cfg: &Config) -> String {
     let items = typst_tuple(gen.items.iter().map(summary_dict).collect::<Vec<_>>());
     format!(
-        "(kind: {}, title: {}, description: {}, date: none, updated: none, weight: none, lang: {}, url: {}, canonical_url: {}, current_url: {}, slug: none, path: {}, file_path: none, source: none, section: {}, parent_section: none, ancestors: (), tags: (), categories: (), aliases: (), toc: (), prev: {}, next: {}, extra: (:), items: {}, page_number: {}, total_pages: {})",
+        "(kind: {}, title: {}, description: {}, date: none, updated: none, weight: none, lang: {}, url: {}, canonical_url: {}, current_url: {}, slug: none, path: {}, file_path: none, source: none, section: {}, parent_section: none, ancestors: (), tags: (), categories: (), aliases: (), toc: (), prev: {}, next: {}, items: {}, page_number: {}, total_pages: {})",
         typst_string(&gen.kind),
         typst_string(&gen.title),
         typst_opt_string(&gen.description),
@@ -3962,7 +5190,7 @@ fn generated_page_dict(gen: &GeneratedPage, cfg: &Config) -> String {
 
 fn summary_dict(page: &PageSummary) -> String {
     format!(
-        "(kind: {}, title: {}, url: {}, canonical_url: {}, slug: {}, path: {}, file_path: {}, description: {}, date: {}, updated: {}, weight: {}, section: {}, parent_section: {}, ancestors: {}, tags: {}, categories: {}, aliases: {}, source: {}, excerpt: {}, toc: {}, extra: {})",
+        "(kind: {}, title: {}, url: {}, canonical_url: {}, slug: {}, path: {}, file_path: {}, description: {}, date: {}, updated: {}, weight: {}, section: {}, parent_section: {}, ancestors: {}, tags: {}, categories: {}, aliases: {}, source: {}, excerpt: {}, toc: {}{})",
         typst_string(&page.kind),
         typst_string(&page.title),
         typst_string(&page.url),
@@ -3983,8 +5211,20 @@ fn summary_dict(page: &PageSummary) -> String {
         typst_string(&page.source),
         typst_opt_string(&page.excerpt),
         toc_array(&page.toc),
-        typst_toml_table(&page.extra),
+        metadata_fields_typst(&page.fields),
     )
+}
+
+fn metadata_fields_typst(fields: &BTreeMap<String, MetadataField>) -> String {
+    if fields.is_empty() {
+        return String::new();
+    }
+    let fields = fields
+        .iter()
+        .map(|(name, field)| format!("{}: {}", typst_ident(name), field.typst))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(", {fields}")
 }
 
 fn typst_ident(key: &str) -> String {
@@ -4135,7 +5375,7 @@ fn sections_dict_typ(
         let parent = parent_section_name(name);
         let ancestors = section_ancestors(name);
         format!(
-            "(name: {}, title: {}, description: {}, path: {}, parent: {}, ancestors: {}, children: {}, pages: {}, sort_by: {}, weight: {}, extra: {})",
+            "(name: {}, title: {}, description: {}, path: {}, parent: {}, ancestors: {}, children: {}, pages: {}, sort_by: {}, weight: {}{})",
             typst_string(name),
             typst_string(&meta.and_then(|m| m.title.clone()).unwrap_or_else(|| name.clone())),
             typst_opt_string(&meta.and_then(|m| m.description.clone())),
@@ -4146,7 +5386,7 @@ fn sections_dict_typ(
             typst_tuple(pages_in_section),
             typst_opt_string(&meta.and_then(|m| m.sort_by.clone())),
             meta.and_then(|m| m.weight).map(|w| w.to_string()).unwrap_or_else(|| "none".to_string()),
-            typst_toml_table(&meta.map(|m| m.extra()).unwrap_or_default()),
+            meta.map(|m| metadata_fields_typst(&m.fields)).unwrap_or_default(),
         )
     }).collect::<Vec<_>>();
     typst_tuple(items)
@@ -4192,7 +5432,7 @@ description = "Virtual site data package generated by typage."
 
 #let section(name) = {
   let found = sections.filter(sec => sec.name == name)
-  if found.len() == 0 { (name: name, title: name, description: none, path: "/" + name + "/", parent: none, ancestors: (), children: (), pages: (), sort_by: none, weight: none, extra: (:)) } else { found.first() }
+  if found.len() == 0 { (name: name, title: name, description: none, path: "/" + name + "/", parent: none, ancestors: (), children: (), pages: (), sort_by: none, weight: none) } else { found.first() }
 }
 
 #let children(item) = {
@@ -4347,6 +5587,7 @@ fn bundle_source(
     data_path: &Path,
     pages: &[Page],
     generated: &[GeneratedPage],
+    collections: &ContentCollections,
 ) -> Result<String> {
     let bundle_dir = root.join(&cfg.cache_dir);
     let data_rel = relative_path(&bundle_dir, data_path)?;
@@ -4371,6 +5612,13 @@ fn bundle_source(
             typst_string(&to_posix_path(&template_rel))
         ));
         out.push_str(&format!("  #let current = {}\n", page_dict(page)));
+        out.push_str("  #let __typage_current = current\n");
+        out.push_str(
+            &page_metadata_validation_typ(page, collections)
+                .lines()
+                .map(|line| format!("  {line}\n"))
+                .collect::<String>(),
+        );
         out.push_str("  #let asset = path => if site.base_url == \"\" { path } else { site.base_url + path }\n");
         out.push_str("  #show: render.with(site: site, page: current, pages: pages, taxonomies: taxonomies)\n");
         let source_dir = page.source.parent().unwrap_or(root);
@@ -4461,7 +5709,7 @@ mod tests {
             source: format!("{}.typ", url.trim_matches('/')),
             excerpt: None,
             toc: Vec::new(),
-            extra: BTreeMap::new(),
+            fields: BTreeMap::new(),
         }
     }
 
@@ -4558,7 +5806,7 @@ mod tests {
                 source: "awards/index.typ".to_string(),
                 excerpt: None,
                 toc: Vec::new(),
-                extra: BTreeMap::new(),
+                fields: BTreeMap::new(),
             },
             PageSummary {
                 kind: "page".to_string(),
@@ -4581,7 +5829,7 @@ mod tests {
                 source: "awards/child.typ".to_string(),
                 excerpt: None,
                 toc: Vec::new(),
-                extra: BTreeMap::new(),
+                fields: BTreeMap::new(),
             },
         ];
         let generated = make_generated_pages(&cfg, &out, &pages, &BTreeMap::new());
@@ -4949,20 +6197,137 @@ Use `read("inline.dat", encoding: none)` in examples.
     }
 
     #[test]
-    fn frontmatter_extra_merges_explicit_and_flattened_values() {
-        let raw = r#"title = "Hello"
+    fn toml_frontmatter_unknown_fields_become_metadata_fields() {
+        let raw = r#"---
+title = "Hello"
 authors = ["Eito"]
+---
+
+Body
+"#;
+        let (fm, body) = split_metadata(Path::new("content/hello.typ"), raw).unwrap();
+        assert_eq!(body, "Body\n");
+        assert_eq!(
+            fm.fields
+                .get("authors")
+                .and_then(|field| field.value.as_ref())
+                .and_then(|value| value.as_array())
+                .and_then(|values| values.first())
+                .and_then(|value| value.as_str()),
+            Some("Eito")
+        );
+        assert_eq!(
+            fm.fields.get("authors").map(|field| field.typst.as_str()),
+            Some("(\"Eito\",)")
+        );
+    }
+
+    #[test]
+    fn toml_extra_table_is_rejected() {
+        let raw = r#"---
+title = "Hello"
 
 [extra]
 series = "examples"
+---
+
+Body
 "#;
-        let fm: FrontMatter = toml::from_str(raw).unwrap();
-        let extra = fm.extra();
+        let err = split_metadata(Path::new("content/hello.typ"), raw)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("`[extra]` is no longer supported"));
+    }
+
+    #[test]
+    fn toml_frontmatter_still_splits_metadata() {
+        let raw = r#"---
+title = "Hello"
+tags = ["typst", "ssg"]
+---
+
+Body
+"#;
+        let (meta, body) = split_metadata(Path::new("content/hello.typ"), raw).unwrap();
+        assert_eq!(meta.title.as_deref(), Some("Hello"));
+        assert_eq!(meta.tags, vec!["typst".to_string(), "ssg".to_string()]);
+        assert_eq!(body, "Body\n");
+    }
+
+    #[test]
+    fn typst_project_metadata_directive_maps_custom_fields() {
+        let raw = r#"#show: project.with(
+  title: "typshade",
+  description: "A Typst package for visualizing multiple-sequence alignments in bioinformatics.",
+  date: "2026-05-23",
+  updated: "2026-06-30",
+  toc: false,
+  languages: ("Typst",),
+  links: (
+    (label: "GitHub", url: "https://github.com/rice8y/typshade"),
+    (label: "Typst Universe", url: "https://typst.app/universe/package/typshade/"),
+  ),
+)
+
+Project body.
+"#;
+        let (meta, body) = split_metadata(Path::new("content/projects/typshade.typ"), raw).unwrap();
+        assert_eq!(meta.title.as_deref(), Some("typshade"));
+        assert_eq!(meta.date.as_deref(), Some("2026-05-23"));
+        assert_eq!(meta.updated.as_deref(), Some("2026-06-30"));
+        assert_eq!(meta.toc, Some(false));
+        assert_eq!(body, "Project body.\n");
         assert_eq!(
-            extra.get("series").and_then(|v| v.as_str()),
-            Some("examples")
+            meta.fields
+                .get("languages")
+                .and_then(|field| field.value.as_ref())
+                .and_then(|value| value.as_array())
+                .and_then(|values| values.first())
+                .and_then(|value| value.as_str()),
+            Some("Typst")
         );
-        assert!(matches!(extra.get("authors"), Some(toml::Value::Array(_))));
+        assert_eq!(
+            meta.fields
+                .get("links")
+                .and_then(|field| field.value.as_ref())
+                .and_then(|value| value.as_array())
+                .and_then(|values| values.first())
+                .and_then(|value| value.as_table())
+                .and_then(|table| table.get("label"))
+                .and_then(|value| value.as_str()),
+            Some("GitHub")
+        );
+    }
+
+    #[test]
+    fn toml_frontmatter_and_typst_directive_conflict() {
+        let raw = r#"---
+title = "Hello"
+---
+
+#show: page.with(title: "Hello")
+
+Body
+"#;
+        let err = split_metadata(Path::new("content/conflict.typ"), raw)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cannot combine TOML front matter with Typst metadata directive"));
+        assert!(err.contains("content/conflict.typ"));
+    }
+
+    #[test]
+    fn unsupported_metadata_expression_reports_path_and_position() {
+        let raw = r#"#show: page.with(title: upper("Hello"))
+
+Body
+"#;
+        let err = split_metadata(Path::new("content/demo.typ"), raw)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("content/demo.typ:1:1"));
+        assert!(err.contains("unsupported metadata expression"));
+        assert!(err.contains("upper(\"Hello\")"));
     }
 
     #[test]
@@ -4989,11 +6354,14 @@ series = "examples"
             source: "posts/tutorials/intro.typ".to_string(),
             excerpt: None,
             toc: Vec::new(),
-            extra: BTreeMap::new(),
+            fields: BTreeMap::new(),
         };
-        page.extra.insert(
+        page.fields.insert(
             "series".to_string(),
-            toml::Value::String("guide".to_string()),
+            MetadataField {
+                typst: "\"guide\"".to_string(),
+                value: Some(toml::Value::String("guide".to_string())),
+            },
         );
         let data = site_data_typ(&cfg, &[page], &[], &BTreeMap::new());
         assert!(data.contains("#let sections"));

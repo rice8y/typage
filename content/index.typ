@@ -1,8 +1,8 @@
----
-title = "Typage"
-description = "A small Typst-native starter for static sites"
-template = "base.typ"
----
+#show: page.with(
+  title: "Typage",
+  description: "A small Typst-native starter for static sites",
+  template: "base.typ",
+)
 
 #import "@local/typage-theme:0.1.1": callout, card
 
@@ -13,7 +13,7 @@ Typage is an experimental SSG that lets you write content, templates, and theme 
 ]
 
 #card(title: "Content first", href: "/posts/hello/")[
-  Use front matter, section pages, internal links, taxonomies, and search indexes without leaving Typst.
+  Use Typst-native metadata, section pages, internal links, taxonomies, and search indexes without leaving Typst.
 ]
 
 #card(title: "Themeable", href: "/about/")[

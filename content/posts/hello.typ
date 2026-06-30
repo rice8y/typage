@@ -1,10 +1,10 @@
----
-title = "Hello Typage"
-description = "Your first article with Typst HTML export"
-date = "2026-06-28"
-template = "base.typ"
-tags = ["typst", "ssg"]
----
+#show: page.with(
+  title: "Hello Typage",
+  description: "Your first article with Typst HTML export",
+  date: "2026-06-28",
+  template: "base.typ",
+  tags: ("typst", "ssg"),
+)
 
 Typage lets you write both article content and site templates in Typst.
 

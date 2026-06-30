@@ -86,6 +86,91 @@ fn init_and_build_basic_project_with_typst() {
     assert_exists(&project.join("static/.nojekyll"));
     assert_exists(&project.join("static/CNAME"));
 
+    fs::create_dir_all(project.join("content/projects")).unwrap();
+    fs::create_dir_all(project.join("content/legacy")).unwrap();
+    fs::write(
+        project.join("content/config.typ"),
+        r#"#let collections = (
+  pages: collection.with(schema: (
+    title: str,
+    description: optional(str),
+    template: optional(str),
+    weight: optional(int),
+  )),
+  posts: collection.with(schema: (
+    title: str,
+    description: optional(str),
+    date: optional(datetime),
+    updated: optional(datetime),
+    draft: optional(bool),
+    template: optional(str),
+    tags: optional(array(str)),
+  )),
+  projects: collection.with(schema: (
+    title: str,
+    description: str,
+    template: optional(str),
+    languages: array(str),
+    links: array(object((label: str, url: url))),
+  )),
+  legacy: collection.with(schema: (
+    title: str,
+    date: optional(datetime),
+    template: optional(str),
+    authors: optional(array(str)),
+  )),
+)
+"#,
+    )
+    .unwrap();
+    fs::write(
+        project.join("templates/project.typ"),
+        r#"#let render(site: (:), page: (:), pages: (), taxonomies: (:), body) = context {
+  if target() == "html" {
+    html.elem("html")[
+      #html.elem("body")[
+        #html.elem("h1")[#page.title]
+        #html.elem("p", attrs: (id: "language"))[#page.languages.first()]
+        #html.elem("a", attrs: (href: page.links.first().url))[#page.links.first().label]
+        #html.elem("article")[#body]
+      ]
+    ]
+  } else {
+    body
+  }
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        project.join("content/projects/typshade.typ"),
+        r#"#show: project.with(
+  title: "typshade",
+  description: "A Typst package for visualizing multiple-sequence alignments in bioinformatics.",
+  template: "project.typ",
+  languages: ("Typst",),
+  links: (
+    (label: "GitHub", url: "https://github.com/rice8y/typshade"),
+  ),
+)
+
+Project body.
+"#,
+    )
+    .unwrap();
+    fs::write(
+        project.join("content/legacy/toml.typ"),
+        r#"---
+title = "Legacy TOML"
+date = "2026-06-23"
+authors = ["Eito"]
+---
+
+Legacy body.
+"#,
+    )
+    .unwrap();
+
     let build = Command::new(exe)
         .arg("build")
         .arg("--root")
@@ -100,8 +185,15 @@ fn init_and_build_basic_project_with_typst() {
     );
 
     assert_exists(&project.join("public/index.html"));
+    assert_exists(&project.join("public/projects/typshade/index.html"));
+    assert_exists(&project.join("public/legacy/toml/index.html"));
     assert_exists(&project.join("public/.nojekyll"));
     assert_exists(&project.join("public/CNAME"));
+    assert!(!project.join("public/config/index.html").exists());
+    let project_html =
+        fs::read_to_string(project.join("public/projects/typshade/index.html")).unwrap();
+    assert!(project_html.contains("Typst"));
+    assert!(project_html.contains("GitHub"));
 
     let doctor = Command::new(exe)
         .arg("doctor")

@@ -1,9 +1,9 @@
----
-title = "About"
-description = "How this starter is organized"
-template = "base.typ"
-weight = 20
----
+#show: page.with(
+  title: "About",
+  description: "How this starter is organized",
+  template: "base.typ",
+  weight: 20,
+)
 
 The Typage starter separates core behavior, templates, content, and static assets so each part can grow independently.
 

@@ -170,6 +170,26 @@ Legacy body.
 "#,
     )
     .unwrap();
+    let mut config = fs::read_to_string(project.join("config.toml")).unwrap();
+    config.push_str(
+        r#"
+
+[[pdf_documents]]
+path = "print.pdf"
+title = "Print Version"
+description = "Combined print document."
+template = "print.typ"
+sections = ["posts"]
+sort_by = "date_desc"
+
+[[pdf_documents]]
+path = "projects.pdf"
+title = "Projects"
+template = "print.typ"
+pages = ["projects/typshade.typ"]
+"#,
+    );
+    fs::write(project.join("config.toml"), config).unwrap();
 
     let build = Command::new(exe)
         .arg("build")
@@ -187,6 +207,8 @@ Legacy body.
     assert_exists(&project.join("public/index.html"));
     assert_exists(&project.join("public/projects/typshade/index.html"));
     assert_exists(&project.join("public/legacy/toml/index.html"));
+    assert_exists(&project.join("public/print.pdf"));
+    assert_exists(&project.join("public/projects.pdf"));
     assert_exists(&project.join("public/.nojekyll"));
     assert_exists(&project.join("public/CNAME"));
     assert!(!project.join("public/config/index.html").exists());
@@ -194,6 +216,38 @@ Legacy body.
         fs::read_to_string(project.join("public/projects/typshade/index.html")).unwrap();
     assert!(project_html.contains("Typst"));
     assert!(project_html.contains("GitHub"));
+
+    let cached_build = Command::new(exe)
+        .arg("build")
+        .arg("--root")
+        .arg(&project)
+        .arg("--explain")
+        .output()
+        .expect("run cached typage build");
+    assert!(
+        cached_build.status.success(),
+        "cached build failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&cached_build.stdout),
+        String::from_utf8_lossy(&cached_build.stderr)
+    );
+    let cached_stdout = String::from_utf8_lossy(&cached_build.stdout);
+    assert!(cached_stdout.contains("skip pdf document print.pdf"));
+
+    let per_page_pdf = Command::new(exe)
+        .arg("build")
+        .arg("--root")
+        .arg(&project)
+        .arg("--pdf")
+        .output()
+        .expect("run typage build --pdf");
+    assert!(
+        per_page_pdf.status.success(),
+        "build --pdf failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&per_page_pdf.stdout),
+        String::from_utf8_lossy(&per_page_pdf.stderr)
+    );
+    assert_exists(&project.join("public/posts/hello/index.pdf"));
+    assert_exists(&project.join("public/print.pdf"));
 
     let doctor = Command::new(exe)
         .arg("doctor")

@@ -35,6 +35,7 @@ In the Typst CLI, HTML export can be enabled with `--features html` or `TYPST_FE
 - Collection schemas in `content/config.typ`.
 - Legacy-compatible TOML front matter via `serde` and `toml`.
 - Per-page `template: "..."` selection.
+- Combined print PDF documents through `[[pdf_documents]]`.
 - Section metadata through `_index.typ`.
 - Section and taxonomy pagination through `paginate_by`.
 - Sorting through `sort_by`.
@@ -106,6 +107,7 @@ typage/
 |-- templates/
 |   |-- base.typ
 |   |-- list.typ
+|   |-- print.typ
 |   |-- helpers.typ
 |   `-- components/
 |-- static/
@@ -510,6 +512,55 @@ typage build --quiet
 ```
 
 `--profile` prints compile wall time, sum of per-job Typst times, and the slowest pages. `--verbose` prints each compiled page. `--explain` prints why each item is rebuilt or skipped and reports unresolved local dependencies.
+
+## Print PDF / Combined PDF Export
+
+`typage build --pdf` writes one `index.pdf` next to each built content page.
+
+Use `[[pdf_documents]]` when you want one PDF that combines multiple content pages into a print document:
+
+```toml
+[[pdf_documents]]
+path = "print.pdf"
+title = "r-Portfolio"
+description = "Print version of r-Portfolio."
+template = "print.typ"
+sections = ["blog", "projects"]
+sort_by = "date_desc"
+include_drafts = false
+include_future = false
+include_expired = false
+
+[[pdf_documents]]
+path = "projects.pdf"
+title = "Projects"
+template = "print.typ"
+pages = ["projects/typage.typ", "/projects/typshade/"]
+```
+
+`path` is a PDF path relative to `out_dir`. `template` is resolved relative to `templates_dir`. `sections` selects content pages by section, while `pages` can explicitly list source paths, Typage content paths, or page URLs. Explicit `pages` keep their listed order; section-selected pages use the same `sort_by` vocabulary as section lists.
+
+Combined print PDFs are generated during `typage build`, served like any other file from `public/`, and participate in the incremental cache, `--force`, `--explain`, stale output cleanup, and `doctor` validation.
+
+A minimal `templates/print.typ`:
+
+```typst
+#let render(site: (:), document: (:), pages: (), body) = {
+  set page(numbering: "1")
+
+  align(center)[
+    #text(size: 24pt, weight: "bold")[#document.title]
+  ]
+
+  pagebreak()
+  outline()
+  pagebreak()
+
+  body
+}
+```
+
+Typage calls `render` with `site`, `document`, selected page metadata, and `body`. The generated `body` contains the selected content pages in order, with a local `page` variable available for each page block. Typage sets the PDF document title before calling `render`; inside the template, use `document.title` for visible text. HTML-only content or templates that call `html.elem(...)` must guard those calls with `target() == "html"` or provide a PDF fallback.
 
 ## Parallel Compile
 

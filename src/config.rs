@@ -139,6 +139,10 @@ pub struct PdfDocumentConfig {
     pub template: String,
     pub sections: Vec<String>,
     pub pages: Vec<String>,
+    /// Sections that should receive their own heading in combined PDF output.
+    pub section_headings: Vec<String>,
+    /// Heading level used for generated section headings.
+    pub section_heading_level: usize,
     pub sort_by: Option<String>,
     pub include_drafts: Option<bool>,
     pub include_future: Option<bool>,
@@ -168,6 +172,8 @@ impl Default for PdfDocumentConfig {
             template: "print.typ".to_string(),
             sections: Vec::new(),
             pages: Vec::new(),
+            section_headings: Vec::new(),
+            section_heading_level: 1,
             sort_by: None,
             include_drafts: None,
             include_future: None,
@@ -298,6 +304,8 @@ title = "Print"
 description = "Combined print document."
 template = "print.typ"
 sections = ["posts", "projects"]
+section_headings = ["posts"]
+section_heading_level = 1
 sort_by = "date_desc"
 include_drafts = false
 
@@ -312,6 +320,8 @@ pages = ["projects/typage.typ", "/projects/typshade/"]
         assert_eq!(cfg.pdf_documents[0].path, "print.pdf");
         assert_eq!(cfg.pdf_documents[0].template, "print.typ");
         assert_eq!(cfg.pdf_documents[0].sections, vec!["posts", "projects"]);
+        assert_eq!(cfg.pdf_documents[0].section_headings, vec!["posts"]);
+        assert_eq!(cfg.pdf_documents[0].section_heading_level, 1);
         assert_eq!(cfg.pdf_documents[0].include_drafts, Some(false));
         assert_eq!(
             cfg.pdf_documents[1].pages,

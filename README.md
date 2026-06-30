@@ -527,6 +527,8 @@ description = "Print version of r-Portfolio."
 template = "print.typ"
 sections = ["blog", "projects"]
 sort_by = "date_desc"
+section_headings = ["blog", "projects"]
+section_heading_level = 1
 include_drafts = false
 include_future = false
 include_expired = false
@@ -539,6 +541,8 @@ pages = ["projects/typage.typ", "/projects/typshade/"]
 ```
 
 `path` is a PDF path relative to `out_dir`. `template` is resolved relative to `templates_dir`. `sections` selects content pages by section, while `pages` can explicitly list source paths, Typage content paths, or page URLs. Explicit `pages` keep their listed order; section-selected pages use the same `sort_by` vocabulary as section lists.
+
+Set `section_headings` to insert section-level headings before pages from those sections. Those generated section headings use `section_heading_level`, and page titles in those sections are emitted one level deeper. For example, `section_headings = ["blog", "projects"]` makes `Blog` and `Projects` level-1 headings while individual post and project titles become level-2 headings.
 
 Combined print PDFs are generated during `typage build`, served like any other file from `public/`, and participate in the incremental cache, `--force`, `--explain`, stale output cleanup, and `doctor` validation.
 

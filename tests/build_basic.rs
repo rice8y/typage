@@ -222,6 +222,7 @@ pages = ["projects/typshade.typ"]
         .arg("--root")
         .arg(&project)
         .arg("--explain")
+        .env("NO_COLOR", "1")
         .output()
         .expect("run cached typage build");
     assert!(

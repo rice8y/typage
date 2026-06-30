@@ -28,9 +28,17 @@ pub struct FrontMatter {
     pub toc: Option<bool>,
     pub sort_by: Option<String>,
     pub paginate_by: Option<usize>,
-    pub extra: BTreeMap<String, toml::Value>,
+    #[serde(default, skip_deserializing)]
+    pub fields: BTreeMap<String, MetadataField>,
     #[serde(flatten)]
-    pub flattened_extra: BTreeMap<String, toml::Value>,
+    #[serde(skip_serializing)]
+    pub flattened_fields: BTreeMap<String, toml::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetadataField {
+    pub typst: String,
+    pub value: Option<toml::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,17 +99,7 @@ pub struct PageSummary {
     pub source: String,
     pub excerpt: Option<String>,
     pub toc: Vec<TocItem>,
-    pub extra: BTreeMap<String, toml::Value>,
-}
-
-impl FrontMatter {
-    pub fn extra(&self) -> BTreeMap<String, toml::Value> {
-        let mut merged = self.flattened_extra.clone();
-        for (key, value) in &self.extra {
-            merged.insert(key.clone(), value.clone());
-        }
-        merged
-    }
+    pub fields: BTreeMap<String, MetadataField>,
 }
 
 impl Page {
@@ -131,7 +129,7 @@ impl Page {
                 .clone()
                 .or_else(|| self.meta.description.clone()),
             toc: self.toc.clone(),
-            extra: self.meta.extra(),
+            fields: self.meta.fields.clone(),
         }
     }
 }

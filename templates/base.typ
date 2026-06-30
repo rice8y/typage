@@ -13,7 +13,7 @@
       #html.elem("head")[
         #html.elem("meta", attrs: (charset: "utf-8"))
         #html.elem("meta", attrs: (name: "viewport", content: "width=device-width, initial-scale=1"))
-        #html.elem("meta", attrs: (name: "generator", content: "typage 0.24.2"))
+        #html.elem("meta", attrs: (name: "generator", content: "typage 0.1.1"))
         #if site.base_url != "" {
           html.elem("meta", attrs: (name: "typage-base-url", content: site.base_url))
         }

@@ -5502,8 +5502,14 @@ fn prepare_print_document_jobs(
         }
 
         let wrapper_path = print_document_wrapper_path(&print_root, idx, doc)?;
-        let wrapper =
-            print_document_wrapper_source(root, cfg, doc, &selected_pages, &wrapper_path)?;
+        let wrapper = print_document_wrapper_source(
+            root,
+            cfg,
+            doc,
+            &selected_pages,
+            section_meta,
+            &wrapper_path,
+        )?;
         write_if_changed(&wrapper_path, &wrapper)?;
         jobs.push(PrintDocumentJob {
             label,
@@ -5533,6 +5539,7 @@ fn print_document_wrapper_source(
     cfg: &Config,
     doc: &PdfDocumentConfig,
     pages: &[Page],
+    section_meta: &BTreeMap<String, FrontMatter>,
     wrapper_path: &Path,
 ) -> Result<String> {
     let wrapper_dir = wrapper_path.parent().unwrap_or(root);
@@ -5548,12 +5555,41 @@ fn print_document_wrapper_source(
         page_tuple,
     );
 
+    let section_heading_level = doc.section_heading_level.clamp(1, 5);
+    let page_heading_level = (section_heading_level + 1).min(6);
+    let section_heading_marks = heading_marks(section_heading_level);
+    let page_heading_marks = heading_marks(page_heading_level);
+    let mut last_heading_section: Option<&str> = None;
+
     for (idx, page) in pages.iter().enumerate() {
         let source_dir = page.source.parent().unwrap_or(root);
         let body = rewrite_local_dependency_paths(&page.processed_body, source_dir, wrapper_dir)?;
+        let has_section_heading = doc
+            .section_headings
+            .iter()
+            .any(|section| section == &page.section);
+        let body = if has_section_heading {
+            shift_heading_levels(&body, 1)
+        } else {
+            body
+        };
+        let title_heading_marks = if has_section_heading {
+            &page_heading_marks
+        } else {
+            "="
+        };
         out.push_str("#[\n");
         out.push_str(&format!("#let page = __typage_pages.at({idx})\n\n"));
-        out.push_str("= #page.title\n\n");
+        if has_section_heading && last_heading_section != Some(page.section.as_str()) {
+            let title = pdf_document_section_heading_title(&page.section, section_meta);
+            out.push_str(&format!(
+                "{} #{}\n\n",
+                section_heading_marks,
+                typst_string(&title)
+            ));
+            last_heading_section = Some(page.section.as_str());
+        }
+        out.push_str(&format!("{title_heading_marks} #page.title\n\n"));
         out.push_str(&body);
         if !body.ends_with('\n') {
             out.push('\n');
@@ -5566,12 +5602,73 @@ fn print_document_wrapper_source(
     Ok(out)
 }
 
+fn heading_marks(level: usize) -> String {
+    "=".repeat(level.clamp(1, 6))
+}
+
+fn pdf_document_section_heading_title(
+    section: &str,
+    section_meta: &BTreeMap<String, FrontMatter>,
+) -> String {
+    section_meta
+        .get(section)
+        .and_then(|meta| meta.title.clone())
+        .unwrap_or_else(|| humanize_section_name(section))
+}
+
+fn humanize_section_name(section: &str) -> String {
+    section
+        .split(['/', '-', '_'])
+        .filter(|part| !part.is_empty())
+        .map(capitalize_first)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn capitalize_first(value: &str) -> String {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+    first.to_uppercase().collect::<String>() + chars.as_str()
+}
+
+fn shift_heading_levels(source: &str, amount: usize) -> String {
+    if amount == 0 {
+        return source.to_string();
+    }
+
+    let mut out = String::with_capacity(source.len());
+    let mut in_raw_block = false;
+    for line in source.split_inclusive('\n') {
+        let (body, newline) = line
+            .strip_suffix('\n')
+            .map(|body| (body, "\n"))
+            .unwrap_or((line, ""));
+        let raw_fence = body.trim_start().starts_with("```");
+        if !in_raw_block && is_markup_heading_line(body) {
+            out.push_str(&"=".repeat(amount));
+        }
+        out.push_str(body);
+        out.push_str(newline);
+        if raw_fence {
+            in_raw_block = !in_raw_block;
+        }
+    }
+    out
+}
+
+fn is_markup_heading_line(line: &str) -> bool {
+    let marker_count = line.chars().take_while(|&ch| ch == '=').count();
+    marker_count > 0 && line.chars().nth(marker_count) == Some(' ')
+}
+
 fn pdf_document_dict(cfg: &Config, doc: &PdfDocumentConfig, page_count: usize) -> Result<String> {
     let title = doc.title.clone().unwrap_or_else(|| cfg.title.clone());
     let path = pdf_document_public_path(doc)?;
     let url = pdf_document_output_url(doc)?;
     Ok(format!(
-        "(kind: {}, title: {}, description: {}, path: {}, url: {}, canonical_url: {}, template: {}, sections: {}, source_pages: {}, page_count: {})",
+        "(kind: {}, title: {}, description: {}, path: {}, url: {}, canonical_url: {}, template: {}, sections: {}, source_pages: {}, section_headings: {}, section_heading_level: {}, page_count: {})",
         typst_string("pdf_document"),
         typst_string(&title),
         typst_opt_string(&doc.description),
@@ -5581,6 +5678,8 @@ fn pdf_document_dict(cfg: &Config, doc: &PdfDocumentConfig, page_count: usize) -
         typst_string(&doc.template),
         typst_array_str(&doc.sections),
         typst_array_str(&doc.pages),
+        typst_array_str(&doc.section_headings),
+        doc.section_heading_level,
         page_count,
     ))
 }
@@ -6482,6 +6581,37 @@ mod tests {
             toc: Vec::new(),
             fields: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn resolves_pdf_section_heading_titles() {
+        let mut section_meta = BTreeMap::new();
+        section_meta.insert(
+            "blog".to_string(),
+            FrontMatter {
+                title: Some("Blog".to_string()),
+                ..FrontMatter::default()
+            },
+        );
+
+        assert_eq!(
+            pdf_document_section_heading_title("blog", &section_meta),
+            "Blog"
+        );
+        assert_eq!(
+            pdf_document_section_heading_title("release-notes", &section_meta),
+            "Release Notes"
+        );
+    }
+
+    #[test]
+    fn shifts_markup_headings_outside_raw_blocks() {
+        let source = "intro\n== Section\n```typ\n== Raw\n```\n=== Nested\n";
+        let got = shift_heading_levels(source, 1);
+        assert_eq!(
+            got,
+            "intro\n=== Section\n```typ\n== Raw\n```\n==== Nested\n"
+        );
     }
 
     fn test_page(title: &str, file_path: &str, section: &str, date: &str) -> Page {

@@ -42,6 +42,7 @@ pub struct Config {
     pub atom_feed: bool,
     pub atom_path: String,
     pub feeds: Vec<FeedConfig>,
+    pub pdf_documents: Vec<PdfDocumentConfig>,
     pub sitemap: bool,
     #[serde(default, deserialize_with = "deserialize_search_config")]
     pub search: SearchConfig,
@@ -127,6 +128,23 @@ pub struct FeedConfig {
     pub limit: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PdfDocumentConfig {
+    /// Output PDF path relative to `out_dir`, for example `print.pdf`.
+    pub path: String,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    /// Template path relative to `templates_dir`.
+    pub template: String,
+    pub sections: Vec<String>,
+    pub pages: Vec<String>,
+    pub sort_by: Option<String>,
+    pub include_drafts: Option<bool>,
+    pub include_future: Option<bool>,
+    pub include_expired: Option<bool>,
+}
+
 impl Default for FeedConfig {
     fn default() -> Self {
         Self {
@@ -137,6 +155,23 @@ impl Default for FeedConfig {
             section: None,
             sections: Vec::new(),
             limit: 20,
+        }
+    }
+}
+
+impl Default for PdfDocumentConfig {
+    fn default() -> Self {
+        Self {
+            path: String::new(),
+            title: None,
+            description: None,
+            template: "print.typ".to_string(),
+            sections: Vec::new(),
+            pages: Vec::new(),
+            sort_by: None,
+            include_drafts: None,
+            include_future: None,
+            include_expired: None,
         }
     }
 }
@@ -183,6 +218,7 @@ impl Default for Config {
             atom_feed: true,
             atom_path: "atom.xml".to_string(),
             feeds: Vec::new(),
+            pdf_documents: Vec::new(),
             sitemap: true,
             search: SearchConfig::default(),
             robots: true,
@@ -250,5 +286,36 @@ limit = 0
         assert_eq!(cfg.feeds[0].path, "projects/rss.xml");
         assert_eq!(cfg.feeds[0].section.as_deref(), Some("projects"));
         assert_eq!(cfg.feeds[0].limit, 0);
+    }
+
+    #[test]
+    fn parses_pdf_documents() {
+        let cfg: Config = toml::from_str(
+            r#"
+[[pdf_documents]]
+path = "print.pdf"
+title = "Print"
+description = "Combined print document."
+template = "print.typ"
+sections = ["posts", "projects"]
+sort_by = "date_desc"
+include_drafts = false
+
+[[pdf_documents]]
+path = "projects.pdf"
+pages = ["projects/typage.typ", "/projects/typshade/"]
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.pdf_documents.len(), 2);
+        assert_eq!(cfg.pdf_documents[0].path, "print.pdf");
+        assert_eq!(cfg.pdf_documents[0].template, "print.typ");
+        assert_eq!(cfg.pdf_documents[0].sections, vec!["posts", "projects"]);
+        assert_eq!(cfg.pdf_documents[0].include_drafts, Some(false));
+        assert_eq!(
+            cfg.pdf_documents[1].pages,
+            vec!["projects/typage.typ", "/projects/typshade/"]
+        );
     }
 }

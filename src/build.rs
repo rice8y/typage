@@ -13,7 +13,7 @@ use serde_json::json;
 use typst_syntax::ast::{self, AstNode};
 use typst_syntax::{is_ident, LinkedNode};
 
-use crate::config::{load_config, Config, FeedConfig, SearchConfig};
+use crate::config::{load_config, Config, FeedConfig, PdfDocumentConfig, SearchConfig};
 use crate::model::{
     BuildCache, BuildStats, CacheEntry, FrontMatter, GeneratedPage, MetadataField, Page,
     PageSummary, SkipStats, TocItem,
@@ -121,6 +121,17 @@ struct CompileJob {
 }
 
 #[derive(Debug, Clone)]
+struct PrintDocumentJob {
+    label: String,
+    input: PathBuf,
+    output_pdf: PathBuf,
+    current_json: String,
+    cache_key: String,
+    hash: String,
+    outputs: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
 struct CompileReport {
     label: String,
     duration: Duration,
@@ -140,6 +151,10 @@ pub fn init_project(root: &Path) -> Result<()> {
     write_if_missing(
         root.join("templates/list.typ"),
         include_str!("../templates/list.typ"),
+    )?;
+    write_if_missing(
+        root.join("templates/print.typ"),
+        include_str!("../templates/print.typ"),
     )?;
     write_if_missing(
         root.join("templates/helpers.typ"),
@@ -207,6 +222,10 @@ pub fn new_theme(root: PathBuf, name: String) -> Result<()> {
     write_if_missing(
         theme_root.join("templates/list.typ"),
         include_str!("../templates/list.typ"),
+    )?;
+    write_if_missing(
+        theme_root.join("templates/print.typ"),
+        include_str!("../templates/print.typ"),
     )?;
     write_if_missing(
         theme_root.join("templates/helpers.typ"),
@@ -890,6 +909,29 @@ pub fn doctor(root: PathBuf, typst_override: Option<String>, drafts: bool) -> Re
     if let Err(err) = template_hash(&templates_root, &cfg.list_template) {
         errors.push(format!("list template error: {err:?}"));
     }
+    if !cfg.pdf_documents.is_empty() {
+        let candidate_inclusion = pdf_document_candidate_inclusion(&cfg, drafts);
+        let print_candidates = discover_print_candidate_pages(
+            &root,
+            &cfg,
+            &content_root,
+            &out_root,
+            &section_meta,
+            &collections,
+            candidate_inclusion,
+        )?;
+        errors.extend(validate_pdf_document_configs(
+            &cfg,
+            &templates_root,
+            &static_roots,
+            &out_root,
+            &print_candidates,
+            &generated,
+            &section_meta,
+            drafts,
+        ));
+        println!("pdf documents: {}", cfg.pdf_documents.len());
+    }
     println!("pages: {}", pages.len());
     println!("generated: {}", generated.len());
     println!(
@@ -1222,16 +1264,39 @@ pub fn build_site(opts: &BuildOptions) -> Result<BuildStats> {
         });
     }
 
-    let compile_concurrency = effective_jobs(opts.jobs, cfg.jobs, compile_jobs.len());
+    let print_jobs = prepare_print_document_jobs(
+        &root,
+        &cfg,
+        &content_root,
+        &templates_root,
+        &static_roots,
+        &out_root,
+        &cache_root,
+        &generated,
+        &section_meta,
+        &collections,
+        &mut cache,
+        &mut template_hashes,
+        &mut stats,
+        &site_graph_hash,
+        &cfg_hash_str,
+        opts,
+    )?;
+    let print_outputs = cfg
+        .pdf_documents
+        .iter()
+        .map(|doc| pdf_document_output_path(&out_root, doc))
+        .collect::<Result<Vec<_>>>()?;
+    let total_compile_jobs = compile_jobs.len() + print_jobs.len();
+    let compile_concurrency = effective_jobs(opts.jobs, cfg.jobs, total_compile_jobs);
     if !opts.quiet {
         println!(
             "{} {} {}",
             term::bold("typage"),
             term::cyan("build"),
             term::dim(format!(
-                "({} compile job{})",
-                compile_concurrency,
-                if compile_concurrency == 1 { "" } else { "s" }
+                "({total_compile_jobs} compile job{})",
+                if total_compile_jobs == 1 { "" } else { "s" }
             ))
         );
     }
@@ -1282,6 +1347,40 @@ pub fn build_site(opts: &BuildOptions) -> Result<BuildStats> {
         }
     }
 
+    for job in print_jobs {
+        match run_print_document_job(&cfg, &root, &job) {
+            Ok(report) => {
+                if !opts.quiet && opts.verbose {
+                    println!(
+                        "  {} {} {} {}",
+                        term::green("✓"),
+                        term::dim("pdf document"),
+                        report.label,
+                        term::dim(format_duration(report.duration))
+                    );
+                }
+                cache.entries.insert(
+                    job.cache_key.clone(),
+                    CacheEntry {
+                        hash: job.hash.clone(),
+                        outputs: outputs_to_strings(&job.outputs),
+                    },
+                );
+                stats.generated += 1;
+                reports.push(report);
+            }
+            Err(err) => {
+                stats.failed += 1;
+                if opts.keep_going {
+                    eprintln!("  {} {}", term::red("✗"), job.label);
+                    failures.push(format!("{}\n{err:?}", job.label));
+                } else {
+                    return Err(err);
+                }
+            }
+        }
+    }
+
     for static_root in &static_roots {
         copy_dir(static_root, &out_root)?;
     }
@@ -1301,8 +1400,15 @@ pub fn build_site(opts: &BuildOptions) -> Result<BuildStats> {
     if cfg.search.enabled {
         write_search_index(&out_root, &pages, &cfg.search)?;
     }
-    let desired_outputs =
-        desired_public_outputs(&cfg, &static_roots, &out_root, &pages, &generated, opts.pdf)?;
+    let desired_outputs = desired_public_outputs(
+        &cfg,
+        &static_roots,
+        &out_root,
+        &pages,
+        &generated,
+        &print_outputs,
+        opts.pdf,
+    )?;
     cleanup_public_outputs(&out_root, &desired_outputs)?;
     write_cache(&cache_path, &cache)?;
 
@@ -1508,6 +1614,252 @@ fn compare_pages_for_sort(a: &Page, b: &Page, sort_by: &str) -> std::cmp::Orderi
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PdfDocumentInclusion {
+    drafts: bool,
+    future: bool,
+    expired: bool,
+}
+
+fn pdf_document_inclusion(
+    doc: &PdfDocumentConfig,
+    cfg: &Config,
+    drafts: bool,
+) -> PdfDocumentInclusion {
+    PdfDocumentInclusion {
+        drafts: doc.include_drafts.unwrap_or(drafts),
+        future: doc.include_future.unwrap_or(cfg.build_future),
+        expired: doc.include_expired.unwrap_or(cfg.build_expired),
+    }
+}
+
+fn pdf_document_candidate_inclusion(cfg: &Config, drafts: bool) -> PdfDocumentInclusion {
+    PdfDocumentInclusion {
+        drafts: cfg
+            .pdf_documents
+            .iter()
+            .any(|doc| doc.include_drafts.unwrap_or(drafts)),
+        future: cfg
+            .pdf_documents
+            .iter()
+            .any(|doc| doc.include_future.unwrap_or(cfg.build_future)),
+        expired: cfg
+            .pdf_documents
+            .iter()
+            .any(|doc| doc.include_expired.unwrap_or(cfg.build_expired)),
+    }
+}
+
+fn discover_print_candidate_pages(
+    root: &Path,
+    cfg: &Config,
+    content_root: &Path,
+    out_root: &Path,
+    section_meta: &BTreeMap<String, FrontMatter>,
+    collections: &ContentCollections,
+    inclusion: PdfDocumentInclusion,
+) -> Result<Vec<Page>> {
+    let mut print_cfg = cfg.clone();
+    print_cfg.build_future = inclusion.future;
+    print_cfg.build_expired = inclusion.expired;
+    let (mut pages, _) = discover_pages(
+        root,
+        &print_cfg,
+        content_root,
+        out_root,
+        inclusion.drafts,
+        collections,
+    )?;
+    assign_prev_next(&mut pages, section_meta);
+    Ok(pages)
+}
+
+fn select_pdf_document_page_indices(
+    doc: &PdfDocumentConfig,
+    pages: &[Page],
+    section_meta: &BTreeMap<String, FrontMatter>,
+    inclusion: PdfDocumentInclusion,
+) -> Result<Vec<usize>> {
+    let mut selected = Vec::<usize>::new();
+    let mut seen = BTreeSet::<String>::new();
+
+    for reference in &doc.pages {
+        let matches = pages
+            .iter()
+            .enumerate()
+            .filter(|(_, page)| page_matches_pdf_reference(page, reference))
+            .collect::<Vec<_>>();
+        if matches.is_empty() {
+            bail!("unknown page reference {reference:?}");
+        }
+        if matches.len() > 1 {
+            let candidates = matches
+                .iter()
+                .map(|(_, page)| page.file_path.clone())
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!("ambiguous page reference {reference:?}: {candidates}");
+        }
+        let (idx, page) = matches[0];
+        if !page_allowed_in_pdf_document(page, inclusion) {
+            bail!(
+                "page reference {:?} is excluded by pdf document filters: {}",
+                reference,
+                page.source.display()
+            );
+        }
+        insert_pdf_selection(&mut selected, &mut seen, idx, page);
+    }
+
+    let mut section_indices = Vec::<usize>::new();
+    if !doc.sections.is_empty() {
+        for section in &doc.sections {
+            if !section_exists_for_pdf_document(section, pages, section_meta) {
+                bail!("unknown section reference {section:?}");
+            }
+        }
+        for (idx, page) in pages.iter().enumerate() {
+            if !page_allowed_in_pdf_document(page, inclusion) {
+                continue;
+            }
+            if doc
+                .sections
+                .iter()
+                .any(|section| page_belongs_to_pdf_section(page, section))
+            {
+                section_indices.push(idx);
+            }
+        }
+    } else if doc.pages.is_empty() {
+        for (idx, page) in pages.iter().enumerate() {
+            if page_allowed_in_pdf_document(page, inclusion) {
+                section_indices.push(idx);
+            }
+        }
+    }
+
+    let sort_by = pdf_document_sort_by(doc, section_meta);
+    section_indices.sort_by(|&a, &b| compare_pages_for_sort(&pages[a], &pages[b], &sort_by));
+    for idx in section_indices {
+        let page = &pages[idx];
+        insert_pdf_selection(&mut selected, &mut seen, idx, page);
+    }
+
+    if selected.is_empty() {
+        bail!(
+            "pdf document {} selects no content pages",
+            pdf_document_label(doc)
+        );
+    }
+    Ok(selected)
+}
+
+fn insert_pdf_selection(
+    selected: &mut Vec<usize>,
+    seen: &mut BTreeSet<String>,
+    idx: usize,
+    page: &Page,
+) {
+    let key = page.rel.to_string_lossy().replace('\\', "/");
+    if seen.insert(key) {
+        selected.push(idx);
+    }
+}
+
+fn pdf_document_sort_by(
+    doc: &PdfDocumentConfig,
+    section_meta: &BTreeMap<String, FrontMatter>,
+) -> String {
+    doc.sort_by
+        .clone()
+        .or_else(|| {
+            (doc.sections.len() == 1)
+                .then(|| {
+                    section_meta
+                        .get(&doc.sections[0])
+                        .and_then(|meta| meta.sort_by.clone())
+                })
+                .flatten()
+        })
+        .unwrap_or_else(|| "date_desc".to_string())
+}
+
+fn page_allowed_in_pdf_document(page: &Page, inclusion: PdfDocumentInclusion) -> bool {
+    if page.meta.draft && !inclusion.drafts {
+        return false;
+    }
+    if is_future_date(page.meta.date.as_deref()) && !inclusion.future {
+        return false;
+    }
+    if is_expired_date(page.meta.expires.as_deref()) && !inclusion.expired {
+        return false;
+    }
+    true
+}
+
+fn section_exists_for_pdf_document(
+    section: &str,
+    pages: &[Page],
+    section_meta: &BTreeMap<String, FrontMatter>,
+) -> bool {
+    section_meta.contains_key(section)
+        || pages
+            .iter()
+            .any(|page| page_belongs_to_pdf_section(page, section))
+}
+
+fn page_belongs_to_pdf_section(page: &Page, section: &str) -> bool {
+    page.section == section
+        || page
+            .section
+            .strip_prefix(section)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+fn page_matches_pdf_reference(page: &Page, reference: &str) -> bool {
+    let trimmed = reference.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let without_anchor = trimmed.split('#').next().unwrap_or(trimmed);
+    let mut candidates = BTreeSet::<String>::new();
+    candidates.insert(page.url.clone());
+    candidates.insert(page.url.trim_end_matches('/').to_string());
+    candidates.insert(page.path.clone());
+    candidates.insert(page.file_path.clone());
+    candidates.insert(page.rel.to_string_lossy().replace('\\', "/"));
+    candidates.insert(format!("@/{}", page.file_path));
+    candidates.insert(format!("content/{}", page.file_path));
+    let normalized = without_anchor.trim_matches('/').to_string();
+    candidates.contains(without_anchor) || candidates.contains(&normalized)
+}
+
+fn preprocess_print_pages(
+    cfg: &Config,
+    pages: &mut [Page],
+    link_map: &BTreeMap<String, String>,
+) -> Result<()> {
+    for page in pages {
+        let (toc, body, broken_links) =
+            preprocess_body(&page.body, link_map, page.meta.toc.unwrap_or(true));
+        if !broken_links.is_empty() {
+            let msg = format!(
+                "broken internal link(s) in {}: {}",
+                page.source.display(),
+                broken_links.join(", ")
+            );
+            if cfg.fail_on_broken_links {
+                bail!(msg);
+            } else {
+                eprintln!("warning: {msg}");
+            }
+        }
+        page.toc = toc;
+        page.processed_body = body;
+    }
+    Ok(())
+}
+
 fn dependency_hash(source: &Path, body: &str) -> Result<String> {
     let source_dir = source.parent().unwrap_or_else(|| Path::new("."));
     let mut visited = BTreeSet::new();
@@ -1670,6 +2022,116 @@ fn validate_routes(pages: &[Page], generated: &[GeneratedPage]) -> Result<()> {
     Ok(())
 }
 
+fn validate_pdf_document_configs(
+    cfg: &Config,
+    templates_root: &Path,
+    static_roots: &[PathBuf],
+    out_root: &Path,
+    pages: &[Page],
+    generated: &[GeneratedPage],
+    section_meta: &BTreeMap<String, FrontMatter>,
+    drafts: bool,
+) -> Vec<String> {
+    let mut errors = Vec::<String>::new();
+    let mut outputs = collect_reserved_output_paths(static_roots, out_root, pages, generated)
+        .unwrap_or_else(|err| {
+            errors.push(format!("failed to inspect reserved outputs: {err:?}"));
+            BTreeMap::new()
+        });
+    for (idx, doc) in cfg.pdf_documents.iter().enumerate() {
+        let label = format!("pdf_documents[{idx}] ({})", pdf_document_label(doc));
+        match pdf_document_output_path(out_root, doc) {
+            Ok(output) => {
+                if let Err(err) = insert_output_path(
+                    &mut outputs,
+                    clean_path(&output),
+                    format!("pdf document {label}"),
+                ) {
+                    errors.push(err.to_string());
+                }
+            }
+            Err(err) => errors.push(format!("{label}: {err}")),
+        }
+        if doc.template.trim().is_empty() {
+            errors.push(format!("{label}: template must not be empty"));
+        } else if let Err(err) = template_hash(templates_root, &doc.template) {
+            errors.push(format!("{label}: template error: {err:?}"));
+        }
+        if doc.sections.iter().any(|section| section.trim().is_empty()) {
+            errors.push(format!("{label}: section references must not be empty"));
+        }
+        if doc.pages.iter().any(|page| page.trim().is_empty()) {
+            errors.push(format!("{label}: page references must not be empty"));
+        }
+        let inclusion = pdf_document_inclusion(doc, cfg, drafts);
+        if let Err(err) = select_pdf_document_page_indices(doc, pages, section_meta, inclusion) {
+            errors.push(format!("{label}: {err}"));
+        }
+    }
+    errors
+}
+
+fn collect_reserved_output_paths(
+    static_roots: &[PathBuf],
+    out_root: &Path,
+    pages: &[Page],
+    generated: &[GeneratedPage],
+) -> Result<BTreeMap<PathBuf, String>> {
+    let mut outputs = BTreeMap::<PathBuf, String>::new();
+    for page in pages {
+        insert_output_path(
+            &mut outputs,
+            clean_path(&page.output_html),
+            format!("page {}", page.source.display()),
+        )?;
+        insert_output_path(
+            &mut outputs,
+            clean_path(&page.output_pdf),
+            format!("page PDF {}", page.source.display()),
+        )?;
+    }
+    for gen in generated {
+        insert_output_path(
+            &mut outputs,
+            clean_path(&gen.output_html),
+            format!("generated {}", gen.title),
+        )?;
+    }
+    for static_root in static_roots {
+        if !static_root.exists() {
+            continue;
+        }
+        for entry in walkdir::WalkDir::new(static_root) {
+            let entry = entry?;
+            if entry.file_type().is_file() {
+                let rel = entry.path().strip_prefix(static_root)?;
+                insert_output_path(
+                    &mut outputs,
+                    clean_path(&out_root.join(rel)),
+                    format!("static asset {}", entry.path().display()),
+                )?;
+            }
+        }
+    }
+    Ok(outputs)
+}
+
+fn insert_output_path(
+    outputs: &mut BTreeMap<PathBuf, String>,
+    path: PathBuf,
+    label: String,
+) -> Result<()> {
+    if let Some(prev) = outputs.insert(path.clone(), label.clone()) {
+        bail!(
+            "output collision for {}: {} conflicts with {}",
+            path.display(),
+            prev,
+            label
+        );
+    }
+    Ok(())
+}
+
 fn insert_route(seen: &mut BTreeMap<String, String>, url: &str, label: String) -> Result<()> {
     if let Some(prev) = seen.insert(url.to_string(), label.clone()) {
         bail!("route collision for {url}: {prev} conflicts with {label}");
@@ -1735,6 +2197,52 @@ fn public_file_url(path: &str) -> Result<String> {
     Ok(format!("/{clean}"))
 }
 
+fn pdf_document_public_path(doc: &PdfDocumentConfig) -> Result<String> {
+    let trimmed = doc.path.trim();
+    if trimmed.is_empty()
+        || trimmed.starts_with('/')
+        || trimmed.contains('\\')
+        || trimmed.contains('?')
+        || trimmed.contains('#')
+        || trimmed.ends_with('/')
+    {
+        bail!("unsafe pdf document path: {trimmed}");
+    }
+    let path = Path::new(trimmed);
+    if path.is_absolute() {
+        bail!("pdf document path must be relative: {trimmed}");
+    }
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(_) => {}
+            _ => bail!("pdf document path must not contain traversal: {trimmed}"),
+        }
+    }
+    if path.extension().and_then(OsStr::to_str) != Some("pdf") {
+        bail!("pdf document path must end with .pdf: {trimmed}");
+    }
+    for segment in trimmed.split('/') {
+        validate_url_segment(segment)?;
+    }
+    Ok(trimmed.to_string())
+}
+
+fn pdf_document_output_path(out_root: &Path, doc: &PdfDocumentConfig) -> Result<PathBuf> {
+    Ok(out_root.join(pdf_document_public_path(doc)?))
+}
+
+fn pdf_document_output_url(doc: &PdfDocumentConfig) -> Result<String> {
+    Ok(format!("/{}", pdf_document_public_path(doc)?))
+}
+
+fn pdf_document_label(doc: &PdfDocumentConfig) -> String {
+    if doc.path.trim().is_empty() {
+        "<missing path>".to_string()
+    } else {
+        doc.path.clone()
+    }
+}
+
 fn write_alias_pages(out_root: &Path, pages: &[Page]) -> Result<()> {
     for page in pages {
         for alias in &page.meta.aliases {
@@ -1756,6 +2264,7 @@ fn desired_public_outputs(
     out_root: &Path,
     pages: &[Page],
     generated: &[GeneratedPage],
+    pdf_documents: &[PathBuf],
     build_pdf_flag: bool,
 ) -> Result<BTreeSet<PathBuf>> {
     let mut desired = BTreeSet::new();
@@ -1771,6 +2280,9 @@ fn desired_public_outputs(
     }
     for gen in generated {
         desired.insert(gen.output_html.clone());
+    }
+    for pdf in pdf_documents {
+        desired.insert(pdf.clone());
     }
     for static_root in static_roots {
         if static_root.exists() {
@@ -4708,6 +5220,31 @@ fn run_compile_job(cfg: &Config, root: &Path, job: &CompileJob) -> Result<Compil
     })
 }
 
+fn run_print_document_job(
+    cfg: &Config,
+    root: &Path,
+    job: &PrintDocumentJob,
+) -> Result<CompileReport> {
+    let started = Instant::now();
+    let inputs = [("typage_current", job.current_json.as_str())];
+    compile_typst(
+        cfg,
+        root,
+        &job.input,
+        &job.output_pdf,
+        "pdf",
+        "",
+        job.label.clone(),
+        &inputs,
+    )?;
+    Ok(CompileReport {
+        label: job.label.clone(),
+        duration: started.elapsed(),
+        output_count: job.outputs.len(),
+        generated: true,
+    })
+}
+
 fn nav_json(title: &Option<String>, url: &Option<String>) -> serde_json::Value {
     match (title, url) {
         (Some(title), Some(url)) => json!({ "title": title, "url": url }),
@@ -4851,6 +5388,240 @@ fn page_wrapper_source(
         validation,
         body
     ))
+}
+
+fn prepare_print_document_jobs(
+    root: &Path,
+    cfg: &Config,
+    content_root: &Path,
+    templates_root: &Path,
+    static_roots: &[PathBuf],
+    out_root: &Path,
+    cache_root: &Path,
+    generated: &[GeneratedPage],
+    section_meta: &BTreeMap<String, FrontMatter>,
+    collections: &ContentCollections,
+    cache: &mut BuildCache,
+    template_hashes: &mut BTreeMap<String, String>,
+    stats: &mut BuildStats,
+    site_graph_hash: &str,
+    cfg_hash_str: &str,
+    opts: &BuildOptions,
+) -> Result<Vec<PrintDocumentJob>> {
+    if cfg.pdf_documents.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let candidate_inclusion = pdf_document_candidate_inclusion(cfg, opts.drafts);
+    let candidates = discover_print_candidate_pages(
+        root,
+        cfg,
+        content_root,
+        out_root,
+        section_meta,
+        collections,
+        candidate_inclusion,
+    )?;
+    let validation_errors = validate_pdf_document_configs(
+        cfg,
+        templates_root,
+        static_roots,
+        out_root,
+        &candidates,
+        generated,
+        section_meta,
+        opts.drafts,
+    );
+    if !validation_errors.is_empty() {
+        bail!(
+            "invalid pdf document configuration\n\n{}",
+            validation_errors.join("\n")
+        );
+    }
+
+    let print_root = cache_root.join("print");
+    fs::create_dir_all(&print_root)?;
+    let link_map = build_link_map(&candidates);
+    let mut jobs = Vec::<PrintDocumentJob>::new();
+
+    for (idx, doc) in cfg.pdf_documents.iter().enumerate() {
+        let public_path = pdf_document_public_path(doc)?;
+        let output = pdf_document_output_path(out_root, doc)?;
+        let inclusion = pdf_document_inclusion(doc, cfg, opts.drafts);
+        let selected_indices =
+            select_pdf_document_page_indices(doc, &candidates, section_meta, inclusion)?;
+        let mut selected_pages = selected_indices
+            .iter()
+            .map(|&idx| candidates[idx].clone())
+            .collect::<Vec<_>>();
+        preprocess_print_pages(cfg, &mut selected_pages, &link_map)?;
+
+        let template_hash = cached_template_hash(template_hashes, templates_root, &doc.template)?;
+        let document_json = serde_json::to_string(doc)?;
+        let mut page_hashes = Vec::<String>::new();
+        for page in &selected_pages {
+            let meta_hash = serde_json::to_string(&page.meta)?;
+            let dep_hash = dependency_hash(&page.source, &page.body)?;
+            page_hashes.push(hash_strs(&[
+                &page.processed_body,
+                &meta_hash,
+                &dep_hash,
+                &page.url,
+                &page.canonical_url,
+                &page.template,
+            ]));
+        }
+        let page_hash_refs = page_hashes.iter().map(String::as_str).collect::<Vec<_>>();
+        let selected_hash = hash_strs(&page_hash_refs);
+        let hash = hash_strs(&[
+            &document_json,
+            &selected_hash,
+            site_graph_hash,
+            cfg_hash_str,
+            &template_hash,
+        ]);
+        let outputs = vec![output.clone()];
+        let cache_key = format!("pdf_document:{public_path}");
+        let label = format!("pdf document {public_path}");
+        let decision = cache_decision(cache, &cache_key, &hash, &outputs, opts.force);
+        if decision.hit {
+            if opts.explain && !opts.quiet {
+                print_explain("skip", &label, &decision.reasons);
+            }
+            cache.entries.insert(
+                cache_key.clone(),
+                CacheEntry {
+                    hash: hash.clone(),
+                    outputs: outputs_to_strings(&outputs),
+                },
+            );
+            stats.skipped += 1;
+            continue;
+        } else if opts.explain && !opts.quiet {
+            print_explain("rebuild", &label, &decision.reasons);
+        }
+
+        let wrapper_path = print_document_wrapper_path(&print_root, idx, doc)?;
+        let wrapper =
+            print_document_wrapper_source(root, cfg, doc, &selected_pages, &wrapper_path)?;
+        write_if_changed(&wrapper_path, &wrapper)?;
+        jobs.push(PrintDocumentJob {
+            label,
+            input: wrapper_path,
+            output_pdf: output,
+            current_json: pdf_document_current_json(cfg, doc, selected_pages.len())?,
+            cache_key,
+            hash,
+            outputs,
+        });
+    }
+
+    Ok(jobs)
+}
+
+fn print_document_wrapper_path(
+    print_root: &Path,
+    index: usize,
+    doc: &PdfDocumentConfig,
+) -> Result<PathBuf> {
+    let public_path = pdf_document_public_path(doc)?;
+    Ok(print_root.join(format!("{index}-{}.typ", slugify(&public_path))))
+}
+
+fn print_document_wrapper_source(
+    root: &Path,
+    cfg: &Config,
+    doc: &PdfDocumentConfig,
+    pages: &[Page],
+    wrapper_path: &Path,
+) -> Result<String> {
+    let wrapper_dir = wrapper_path.parent().unwrap_or(root);
+    fs::create_dir_all(wrapper_dir)?;
+    let template_path = templates_root(root, cfg).join(&doc.template);
+    let template_rel = relative_path(wrapper_dir, &template_path)?;
+    let document = pdf_document_dict(cfg, doc, pages.len())?;
+    let page_tuple = typst_tuple(pages.iter().map(page_dict).collect::<Vec<_>>());
+    let mut out = format!(
+        "#import {}: render\n#import \"@local/typage:{TYPAGE_VERSION}\" as typage\n\n#let __typage_document = {}\n#let __typage_pages = {}\n#set document(title: __typage_document.title)\n\n#show: render.with(site: typage.site, document: __typage_document, pages: __typage_pages)\n\n",
+        typst_string(&to_posix_path(&template_rel)),
+        document,
+        page_tuple,
+    );
+
+    for (idx, page) in pages.iter().enumerate() {
+        let source_dir = page.source.parent().unwrap_or(root);
+        let body = rewrite_local_dependency_paths(&page.processed_body, source_dir, wrapper_dir)?;
+        out.push_str("#[\n");
+        out.push_str(&format!("#let page = __typage_pages.at({idx})\n\n"));
+        out.push_str("= #page.title\n\n");
+        out.push_str(&body);
+        if !body.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str("]\n");
+        if idx + 1 < pages.len() {
+            out.push_str("#pagebreak()\n\n");
+        }
+    }
+    Ok(out)
+}
+
+fn pdf_document_dict(cfg: &Config, doc: &PdfDocumentConfig, page_count: usize) -> Result<String> {
+    let title = doc.title.clone().unwrap_or_else(|| cfg.title.clone());
+    let path = pdf_document_public_path(doc)?;
+    let url = pdf_document_output_url(doc)?;
+    Ok(format!(
+        "(kind: {}, title: {}, description: {}, path: {}, url: {}, canonical_url: {}, template: {}, sections: {}, source_pages: {}, page_count: {})",
+        typst_string("pdf_document"),
+        typst_string(&title),
+        typst_opt_string(&doc.description),
+        typst_string(&path),
+        typst_string(&url),
+        typst_string(&absolute_url(cfg, &url)),
+        typst_string(&doc.template),
+        typst_array_str(&doc.sections),
+        typst_array_str(&doc.pages),
+        page_count,
+    ))
+}
+
+fn pdf_document_current_json(
+    cfg: &Config,
+    doc: &PdfDocumentConfig,
+    page_count: usize,
+) -> Result<String> {
+    let title = doc.title.clone().unwrap_or_else(|| cfg.title.clone());
+    let path = pdf_document_public_path(doc)?;
+    let url = pdf_document_output_url(doc)?;
+    Ok(serde_json::to_string(&json!({
+        "kind": "pdf_document",
+        "title": title,
+        "description": &doc.description,
+        "date": serde_json::Value::Null,
+        "updated": serde_json::Value::Null,
+        "weight": serde_json::Value::Null,
+        "lang": &cfg.lang,
+        "url": &url,
+        "canonical_url": absolute_url(cfg, &url),
+        "current_url": &url,
+        "slug": serde_json::Value::Null,
+        "path": path,
+        "file_path": serde_json::Value::Null,
+        "source": serde_json::Value::Null,
+        "section": "pdf_document",
+        "parent_section": serde_json::Value::Null,
+        "ancestors": [],
+        "tags": [],
+        "categories": [],
+        "aliases": [],
+        "toc": [],
+        "prev": serde_json::Value::Null,
+        "next": serde_json::Value::Null,
+        "template": &doc.template,
+        "sections": &doc.sections,
+        "source_pages": &doc.pages,
+        "page_count": page_count,
+    }))?)
 }
 
 fn rewrite_local_dependency_paths(
@@ -5713,6 +6484,47 @@ mod tests {
         }
     }
 
+    fn test_page(title: &str, file_path: &str, section: &str, date: &str) -> Page {
+        let mut meta = FrontMatter::default();
+        meta.title = Some(title.to_string());
+        meta.date = Some(date.to_string());
+        let path = file_path.trim_end_matches(".typ").to_string();
+        let url = format!("/{path}/");
+        Page {
+            source: PathBuf::from("content").join(file_path),
+            rel: PathBuf::from(file_path),
+            body: String::new(),
+            processed_body: String::new(),
+            meta,
+            title: title.to_string(),
+            url: url.clone(),
+            canonical_url: url,
+            slug: Path::new(file_path)
+                .file_stem()
+                .and_then(OsStr::to_str)
+                .unwrap_or(title)
+                .to_string(),
+            path,
+            file_path: file_path.to_string(),
+            output_html: PathBuf::from("public")
+                .join(file_path.trim_end_matches(".typ"))
+                .join("index.html"),
+            output_pdf: PathBuf::from("public")
+                .join(file_path.trim_end_matches(".typ"))
+                .join("index.pdf"),
+            template: "base.typ".to_string(),
+            section: section.to_string(),
+            parent_section: parent_section_name(section),
+            ancestors: section_ancestors(section),
+            toc: Vec::new(),
+            hash: String::new(),
+            prev_title: None,
+            prev_url: None,
+            next_title: None,
+            next_url: None,
+        }
+    }
+
     #[test]
     fn resolves_internal_links_and_keeps_raw_spans() {
         let mut map = BTreeMap::new();
@@ -5757,6 +6569,80 @@ mod tests {
         assert!(alias_to_url("old/hello").is_ok());
         assert!(alias_to_url("../escape").is_err());
         assert!(alias_to_url("").is_err());
+    }
+
+    #[test]
+    fn selects_pdf_document_pages_with_explicit_order_then_sorted_sections() {
+        let pages = vec![
+            test_page("Old Project", "projects/old.typ", "projects", "2026-06-01"),
+            test_page("New Post", "posts/new.typ", "posts", "2026-06-30"),
+            test_page("Old Post", "posts/old.typ", "posts", "2026-06-01"),
+        ];
+        let doc = PdfDocumentConfig {
+            path: "print.pdf".to_string(),
+            pages: vec!["projects/old.typ".to_string()],
+            sections: vec!["posts".to_string()],
+            sort_by: Some("date_desc".to_string()),
+            ..PdfDocumentConfig::default()
+        };
+        let indices = select_pdf_document_page_indices(
+            &doc,
+            &pages,
+            &BTreeMap::new(),
+            PdfDocumentInclusion {
+                drafts: false,
+                future: true,
+                expired: true,
+            },
+        )
+        .unwrap();
+        let selected = indices
+            .iter()
+            .map(|&idx| pages[idx].file_path.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            selected,
+            vec!["projects/old.typ", "posts/new.typ", "posts/old.typ"]
+        );
+    }
+
+    #[test]
+    fn rejects_unsafe_pdf_document_paths() {
+        let mut doc = PdfDocumentConfig {
+            path: "print.pdf".to_string(),
+            ..PdfDocumentConfig::default()
+        };
+        assert_eq!(pdf_document_public_path(&doc).unwrap(), "print.pdf");
+        for path in ["", "/print.pdf", "../print.pdf", "print.html", "docs/"] {
+            doc.path = path.to_string();
+            assert!(pdf_document_public_path(&doc).is_err(), "{path}");
+        }
+    }
+
+    #[test]
+    fn detects_pdf_document_static_output_collision() {
+        let tmp =
+            std::env::temp_dir().join(format!("typage-pdf-collision-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let static_root = tmp.join("static");
+        let out_root = tmp.join("public");
+        std::fs::create_dir_all(&static_root).unwrap();
+        std::fs::write(static_root.join("print.pdf"), "static").unwrap();
+        let mut outputs =
+            collect_reserved_output_paths(&[static_root], &out_root, &[], &[]).unwrap();
+        let doc = PdfDocumentConfig {
+            path: "print.pdf".to_string(),
+            ..PdfDocumentConfig::default()
+        };
+        let err = insert_output_path(
+            &mut outputs,
+            clean_path(&pdf_document_output_path(&out_root, &doc).unwrap()),
+            "pdf document print.pdf".to_string(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("output collision"));
+        let _ = std::fs::remove_dir_all(tmp);
     }
 
     #[test]

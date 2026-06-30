@@ -29,6 +29,19 @@ jobs = 0 # 0 = auto
 # Start without taxonomies. Add [[taxonomies]] entries when needed.
 taxonomies = []
 
+# Combined print PDF documents. `typage build --pdf` creates one PDF per page;
+# entries here combine selected content pages into one PDF during every build.
+# [[pdf_documents]]
+# path = "print.pdf"
+# title = "Typage"
+# description = "Print version of the site."
+# template = "print.typ"
+# sections = ["posts"]
+# sort_by = "date_desc"
+# include_drafts = false
+# include_future = false
+# include_expired = false
+
 # Keep the starter minimal. Enable search when you add a search page.
 [search]
 enabled = false

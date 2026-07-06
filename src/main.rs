@@ -2,6 +2,7 @@ mod build;
 mod config;
 mod deploy;
 mod model;
+mod plugin;
 mod serve;
 mod term;
 mod util;
@@ -165,6 +166,11 @@ enum Command {
         #[command(subcommand)]
         command: ThemeCommand,
     },
+    /// Plugin management helpers.
+    Plugin {
+        #[command(subcommand)]
+        command: PluginCommand,
+    },
     /// Remove public/ and .typage/.
     Clean {
         #[arg(long, default_value = ".")]
@@ -228,6 +234,55 @@ enum ThemeCommand {
         name: Option<String>,
         #[arg(long, default_value = ".")]
         root: PathBuf,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum PluginCommand {
+    /// Install and register a plugin.
+    Install {
+        /// Project-local plugin name.
+        name: String,
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        /// Cargo package name. Defaults to typage-plugin-<name>.
+        #[arg(long)]
+        package: Option<String>,
+        /// Crates.io version requirement passed to cargo install.
+        #[arg(long)]
+        version: Option<String>,
+        /// Install from a Git repository.
+        #[arg(long)]
+        git: Option<String>,
+        /// Install from a local Cargo package path.
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// Register an existing executable instead of running cargo install.
+        #[arg(long)]
+        command: Option<String>,
+        /// Replace an existing registration and pass --force to cargo install.
+        #[arg(long)]
+        force: bool,
+    },
+    /// List configured plugins.
+    List {
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+    },
+    /// Validate configured plugins.
+    Doctor {
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+    },
+    /// Run a plugin subcommand manually.
+    Run {
+        /// Project-local plugin name.
+        name: String,
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        /// Arguments passed after the plugin executable.
+        #[arg(last = true)]
+        args: Vec<String>,
     },
 }
 
@@ -351,6 +406,30 @@ fn main() -> Result<()> {
             ThemeCommand::List { root, verbose } => build::list_themes(root, verbose),
             ThemeCommand::Info { root, name } => build::theme_info(root, name),
             ThemeCommand::Check { root, name } => build::theme_check(root, name),
+        },
+        Command::Plugin { command } => match command {
+            PluginCommand::Install {
+                name,
+                root,
+                package,
+                version,
+                git,
+                path,
+                command,
+                force,
+            } => plugin::install(plugin::PluginInstallOptions {
+                root,
+                name,
+                package,
+                version,
+                git,
+                path,
+                command,
+                force,
+            }),
+            PluginCommand::List { root } => plugin::list(root),
+            PluginCommand::Doctor { root } => plugin::doctor(root),
+            PluginCommand::Run { root, name, args } => plugin::run(root, name, args),
         },
         Command::Clean { root } => build::clean(root),
     }

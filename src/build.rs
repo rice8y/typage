@@ -858,6 +858,13 @@ pub fn doctor(root: PathBuf, typst_override: Option<String>, drafts: bool) -> Re
     if cfg.base_url.trim().is_empty() && cfg.sitemap {
         errors.push("base_url is empty but sitemap is enabled".to_string());
     }
+    let plugin_errors = crate::plugin::diagnose_plugins(&root, &cfg);
+    if cfg.plugins.is_empty() {
+        println!("plugins: 0");
+    } else {
+        println!("plugins: {}", cfg.plugins.len());
+    }
+    errors.extend(plugin_errors);
 
     let collections = load_content_collections(&content_root)?;
     let section_meta = discover_sections(&content_root)?;
@@ -1107,6 +1114,8 @@ pub fn build_site(opts: &BuildOptions) -> Result<BuildStats> {
     fs::create_dir_all(&out_root)?;
     fs::create_dir_all(&wrappers_root)?;
     fs::create_dir_all(&generated_root)?;
+
+    crate::plugin::run_build_plugins(&root, &cfg, opts.quiet)?;
 
     let mut cache = read_cache(&cache_path)?;
     let collections = load_content_collections(&content_root)?;

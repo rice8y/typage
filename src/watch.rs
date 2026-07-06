@@ -45,6 +45,12 @@ pub fn watch(root: PathBuf, drafts: bool, pdf: bool, jobs: Option<usize>) -> Res
             println!("watching {}", full.display());
         }
     }
+    for full in crate::plugin::watch_roots(&root, &cfg) {
+        if full.exists() {
+            watcher.watch(&full, RecursiveMode::Recursive)?;
+            println!("watching {}", full.display());
+        }
+    }
 
     let mut last = Instant::now() - Duration::from_secs(10);
     loop {

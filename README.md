@@ -59,6 +59,7 @@ In the Typst CLI, HTML export can be enabled with `--features html` or `TYPST_FE
 - Full-text `search_index.json` with field scores, heading entries, and CJK-friendly tokenization.
 - Theme-owned Typst components through `@local/typage-theme:0.1.3`.
 - Built-in shortcodes: `note`, `figure`, and `youtube`.
+- External generator plugins through `typage plugin`.
 - `serve --live-reload`.
 - Threaded development server with read/write timeouts.
 - Streamed static file responses for large assets.
@@ -67,6 +68,7 @@ In the Typst CLI, HTML export can be enabled with `--features html` or `TYPST_FE
 - Parallel Typst compile jobs through `jobs = 0` or `--jobs`.
 - Job-local page context through `--input typage_current=...`.
 - `doctor`, `new`, `theme new`, `theme list --verbose`, `theme info`, and `theme check`.
+- `plugin install`, `plugin list`, `plugin doctor`, and `plugin run`.
 - Deployment scaffolds for GitHub Pages, Cloudflare Pages, Netlify, and Vercel.
 - `run` scripts plus `dev`, `preview`, and `check` aliases.
 - Generated local Typst packages `@local/typage:0.1.3` and `@local/typage-theme:0.1.3`.
@@ -358,6 +360,59 @@ templates/components/
 
 `typage` copies the active `templates/components/` directory into the generated package `@local/typage-theme:0.1.3`. Project `static/` overrides theme `static/` when both provide the same path.
 
+## Plugins
+
+Plugins are external executables that can generate or update Typage project files before the normal content discovery step. This keeps Typage as the single CLI entrypoint while allowing domain-specific generators, such as a Typst package API documentation generator, to ship independently.
+
+Install and register a plugin:
+
+```sh
+typage plugin install typst-docs
+typage plugin install typst-docs --git https://github.com/rice8y/typage-plugin-typst-docs
+typage plugin install typst-docs --path ../typage-plugin-typst-docs
+typage plugin install typst-docs --command ../tools/typage-plugin-typst-docs
+```
+
+By default, `typage plugin install typst-docs` runs:
+
+```sh
+cargo install typage-plugin-typst-docs --locked
+```
+
+`--git` and `--path` switch the Cargo install source. `--command` skips Cargo and registers an existing executable. The registration is written to `typage.plugins.toml`, which is intended to be committed with the project.
+
+Example registration:
+
+```toml
+[plugins.typst_docs]
+package = "typage-plugin-typst-docs"
+version = "0.1.0"
+watch = ["packages/demo/**/*.typ"]
+outputs = ["content/api"]
+
+[plugins.typst_docs.config]
+source_dir = "packages/demo"
+out_dir = "content/api"
+```
+
+Plugin entries may also live directly in `config.toml` under `[plugins.<name>]`. If both files define the same plugin name, `typage.plugins.toml` wins.
+
+During `typage build`, each enabled plugin is invoked before Typage reads `content/`:
+
+```sh
+<plugin-command> generate --root <project-root> --name <plugin-name>
+```
+
+Typage also sets `TYPAGE_ROOT`, `TYPAGE_PLUGIN_NAME`, and `TYPAGE_PLUGIN_CONFIG_JSON`. `plugin.args` are appended after the generated command arguments. `watch` paths are watched by `typage watch` and `typage serve --live-reload`; they must be project-relative paths.
+
+Plugin doctor checks run:
+
+```sh
+<plugin-command> manifest --json
+```
+
+The manifest must print valid JSON. Typage does not install plugins automatically during build, serve, or deploy; install the plugin binary explicitly in local development and CI.
+
 ## Site API
 
 `@local/typage:0.1.3` exposes data and non-presentational helpers for content and templates:
@@ -648,6 +703,8 @@ typage preview
 typage bundle
 typage doctor
 typage check
+typage plugin list
+typage plugin doctor
 typage clean
 ```
 

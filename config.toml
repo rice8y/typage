@@ -74,3 +74,17 @@ deploy-check = "deploy doctor"
 # post_serve = "echo after serve"
 # pre_deploy = "echo before deploy"
 # post_deploy = "echo after deploy"
+
+# Plugins are external executables that can generate Typage content before build.
+# `typage plugin install <name>` writes typage.plugins.toml by default, but
+# plugin entries can also live here when you want a single config file.
+#
+# [plugins.typst_docs]
+# package = "typage-plugin-typst-docs"
+# version = "0.1.0"
+# watch = ["packages/demo/**/*.typ"]
+# outputs = ["content/api"]
+#
+# [plugins.typst_docs.config]
+# source_dir = "packages/demo"
+# out_dir = "content/api"

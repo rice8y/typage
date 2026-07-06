@@ -126,6 +126,13 @@ fn start_live_rebuild_thread(
                 }
             }
         }
+        for full in crate::plugin::watch_roots(&root, &cfg) {
+            if full.exists() {
+                if let Err(err) = watcher.watch(&full, RecursiveMode::Recursive) {
+                    eprintln!("warning: failed to watch {}: {err}", full.display());
+                }
+            }
+        }
         let mut last = Instant::now() - Duration::from_secs(10);
         loop {
             match rx.recv() {

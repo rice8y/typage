@@ -54,6 +54,7 @@ pub struct Config {
     pub scripts: BTreeMap<String, String>,
     /// Command hooks such as pre_build/post_build.
     pub hooks: BTreeMap<String, String>,
+    pub plugins: BTreeMap<String, PluginConfig>,
     pub taxonomies: Vec<TaxonomyConfig>,
 }
 
@@ -130,6 +131,30 @@ pub struct FeedConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+pub struct PluginConfig {
+    /// Installation source such as `crates.io`, `git`, `path`, or `command`.
+    pub source: String,
+    /// Cargo package name, for example `typage-plugin-typst-docs`.
+    pub package: Option<String>,
+    pub version: Option<String>,
+    pub git: Option<String>,
+    pub path: Option<PathBuf>,
+    /// Executable name or path. Defaults to `package` or `typage-plugin-<name>`.
+    pub command: Option<String>,
+    /// Extra arguments appended when Typage invokes the plugin.
+    pub args: Vec<String>,
+    /// Source paths watched by `typage watch` and `serve --live-reload`.
+    pub watch: Vec<PathBuf>,
+    /// Project paths generated or managed by this plugin.
+    pub outputs: Vec<PathBuf>,
+    /// Disable without removing the plugin entry.
+    pub disabled: bool,
+    /// Plugin-specific configuration passed through as JSON.
+    pub config: BTreeMap<String, toml::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PdfDocumentConfig {
     /// Output PDF path relative to `out_dir`, for example `print.pdf`.
     pub path: String,
@@ -159,6 +184,24 @@ impl Default for FeedConfig {
             section: None,
             sections: Vec::new(),
             limit: 20,
+        }
+    }
+}
+
+impl Default for PluginConfig {
+    fn default() -> Self {
+        Self {
+            source: "crates.io".to_string(),
+            package: None,
+            version: None,
+            git: None,
+            path: None,
+            command: None,
+            args: Vec::new(),
+            watch: Vec::new(),
+            outputs: Vec::new(),
+            disabled: false,
+            config: BTreeMap::new(),
         }
     }
 }
@@ -232,6 +275,7 @@ impl Default for Config {
             extra: BTreeMap::new(),
             scripts: BTreeMap::new(),
             hooks: BTreeMap::new(),
+            plugins: BTreeMap::new(),
             taxonomies: vec![
                 TaxonomyConfig {
                     name: "tags".to_string(),
@@ -249,13 +293,37 @@ impl Default for Config {
 pub fn load_config(root: &Path) -> Result<Config> {
     let path = root.join("config.toml");
     if !path.exists() {
-        return Ok(Config::default());
+        let mut cfg = Config::default();
+        merge_plugin_config(root, &mut cfg)?;
+        return Ok(cfg);
     }
     let raw =
         fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
-    let cfg =
+    let mut cfg =
         toml::from_str(&raw).with_context(|| format!("failed to parse {}", path.display()))?;
+    merge_plugin_config(root, &mut cfg)?;
     Ok(cfg)
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct PluginConfigFile {
+    plugins: BTreeMap<String, PluginConfig>,
+}
+
+fn merge_plugin_config(root: &Path, cfg: &mut Config) -> Result<()> {
+    let path = root.join("typage.plugins.toml");
+    if !path.exists() {
+        return Ok(());
+    }
+    let raw =
+        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    let file: PluginConfigFile =
+        toml::from_str(&raw).with_context(|| format!("failed to parse {}", path.display()))?;
+    for (name, plugin) in file.plugins {
+        cfg.plugins.insert(name, plugin);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -327,5 +395,79 @@ pages = ["projects/typage.typ", "/projects/typshade/"]
             cfg.pdf_documents[1].pages,
             vec!["projects/typage.typ", "/projects/typshade/"]
         );
+    }
+
+    #[test]
+    fn parses_configured_plugins() {
+        let cfg: Config = toml::from_str(
+            r#"
+[plugins.typst_docs]
+package = "typage-plugin-typst-docs"
+version = "0.1.0"
+watch = ["packages/demo/**/*.typ"]
+outputs = ["content/api"]
+
+[plugins.typst_docs.config]
+source_dir = "packages/demo"
+out_dir = "content/api"
+"#,
+        )
+        .unwrap();
+
+        let plugin = cfg.plugins.get("typst_docs").unwrap();
+        assert_eq!(plugin.source, "crates.io");
+        assert_eq!(plugin.package.as_deref(), Some("typage-plugin-typst-docs"));
+        assert_eq!(plugin.version.as_deref(), Some("0.1.0"));
+        assert_eq!(plugin.watch, vec![PathBuf::from("packages/demo/**/*.typ")]);
+        assert_eq!(plugin.outputs, vec![PathBuf::from("content/api")]);
+        assert_eq!(
+            plugin
+                .config
+                .get("source_dir")
+                .and_then(toml::Value::as_str),
+            Some("packages/demo")
+        );
+    }
+
+    #[test]
+    fn load_config_merges_plugin_file() {
+        let tmp =
+            std::env::temp_dir().join(format!("typage-plugin-config-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        fs::write(
+            tmp.join("config.toml"),
+            r#"
+title = "Site"
+
+[plugins.inline]
+command = "inline-plugin"
+"#,
+        )
+        .unwrap();
+        fs::write(
+            tmp.join("typage.plugins.toml"),
+            r#"
+[plugins.docs]
+source = "command"
+command = "docs-plugin"
+
+[plugins.docs.config]
+source_dir = "src"
+"#,
+        )
+        .unwrap();
+
+        let cfg = load_config(&tmp).unwrap();
+        assert_eq!(cfg.title, "Site");
+        assert_eq!(
+            cfg.plugins.get("inline").and_then(|p| p.command.as_deref()),
+            Some("inline-plugin")
+        );
+        assert_eq!(
+            cfg.plugins.get("docs").and_then(|p| p.command.as_deref()),
+            Some("docs-plugin")
+        );
+        let _ = fs::remove_dir_all(tmp);
     }
 }

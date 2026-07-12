@@ -24,6 +24,15 @@ pub struct PluginInstallOptions {
     pub force: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct PluginRegisterOptions {
+    pub root: PathBuf,
+    pub name: String,
+    pub plugin: PluginConfig,
+    pub install: bool,
+    pub force: bool,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 struct PluginFile {
@@ -67,7 +76,7 @@ pub fn install(opts: PluginInstallOptions) -> Result<()> {
     };
 
     if opts.command.is_none() {
-        install_with_cargo(&package, &opts)?;
+        install_with_cargo(&root, &package, &opts)?;
     }
 
     let mut plugin = PluginConfig {
@@ -86,6 +95,29 @@ pub fn install(opts: PluginInstallOptions) -> Result<()> {
     write_plugin_file(&path, &file)?;
     println!("installed plugin {} in {}", opts.name, path.display());
     Ok(())
+}
+
+pub fn register(opts: PluginRegisterOptions) -> Result<()> {
+    validate_plugin_name(&opts.name)?;
+    let root = crate::util::normalize_path(&opts.root)?;
+    if !root.exists() {
+        bail!("project root does not exist: {}", root.display());
+    }
+    if !root.is_dir() {
+        bail!("project root is not a directory: {}", root.display());
+    }
+    let errors = validate_plugin_config(&opts.name, &opts.plugin);
+    if !errors.is_empty() {
+        bail!(
+            "invalid plugin configuration for {}\n\n{}",
+            opts.name,
+            errors.join("\n")
+        );
+    }
+    if opts.install && opts.plugin.command.is_none() {
+        install_configured_plugin(&root, &opts.name, &opts.plugin, opts.force)?;
+    }
+    register_plugin(&root, &opts.name, opts.plugin, opts.force)
 }
 
 pub fn list(root: PathBuf) -> Result<()> {
@@ -255,8 +287,9 @@ pub fn watch_roots(root: &Path, cfg: &Config) -> Vec<PathBuf> {
     roots
 }
 
-fn install_with_cargo(package: &str, opts: &PluginInstallOptions) -> Result<()> {
+fn install_with_cargo(root: &Path, package: &str, opts: &PluginInstallOptions) -> Result<()> {
     let mut cmd = Command::new("cargo");
+    cmd.current_dir(root);
     cmd.arg("install");
     if opts.force {
         cmd.arg("--force");
@@ -282,6 +315,45 @@ fn install_with_cargo(package: &str, opts: &PluginInstallOptions) -> Result<()> 
     if !status.success() {
         bail!("cargo install failed with {status}");
     }
+    Ok(())
+}
+
+fn install_configured_plugin(
+    root: &Path,
+    name: &str,
+    plugin: &PluginConfig,
+    force: bool,
+) -> Result<()> {
+    let package = plugin
+        .package
+        .clone()
+        .unwrap_or_else(|| default_package_name(name));
+    let opts = PluginInstallOptions {
+        root: PathBuf::from("."),
+        name: name.to_string(),
+        package: Some(package.clone()),
+        version: plugin.version.clone(),
+        git: plugin.git.clone(),
+        path: plugin.path.clone(),
+        command: plugin.command.clone(),
+        force,
+    };
+    install_with_cargo(root, &package, &opts)
+}
+
+fn register_plugin(root: &Path, name: &str, plugin: PluginConfig, force: bool) -> Result<()> {
+    let path = plugin_file_path(root);
+    let mut file = read_plugin_file(&path)?;
+    if file.plugins.contains_key(name) && !force {
+        bail!(
+            "plugin {:?} already exists in {}; pass --force to replace it",
+            name,
+            path.display()
+        );
+    }
+    file.plugins.insert(name.to_string(), plugin);
+    write_plugin_file(&path, &file)?;
+    println!("registered plugin {} in {}", name, path.display());
     Ok(())
 }
 
@@ -327,6 +399,9 @@ fn validate_plugin_config(name: &str, plugin: &PluginConfig) -> Vec<String> {
         .is_some_and(|command| command.trim().is_empty())
     {
         errors.push("command must not be empty".to_string());
+    }
+    if plugin.path.is_some() && plugin.git.is_some() {
+        errors.push("path and git cannot both be set".to_string());
     }
     for (kind, paths) in [("watch", &plugin.watch), ("outputs", &plugin.outputs)] {
         for path in paths {
@@ -457,11 +532,14 @@ mod tests {
     #[test]
     fn plugin_paths_must_stay_inside_project() {
         let plugin = PluginConfig {
+            git: Some("https://example.com/plugin.git".to_string()),
+            path: Some(PathBuf::from("../plugin")),
             watch: vec![PathBuf::from("../src")],
             outputs: vec![PathBuf::from("/tmp/out")],
             ..PluginConfig::default()
         };
         let errors = validate_plugin_config("docs", &plugin);
+        assert!(errors.iter().any(|error| error.contains("path and git")));
         assert!(errors.iter().any(|error| error.contains("watch path")));
         assert!(errors.iter().any(|error| error.contains("outputs path")));
     }

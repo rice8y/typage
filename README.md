@@ -33,6 +33,7 @@ In the Typst CLI, HTML export can be enabled with `--features html` or `TYPST_FE
 - Build `content/**/*.typ` into `public/**/index.html`.
 - Typst-native metadata directives with `#show: page.with(...)` and `#show: project.with(...)`.
 - Collection schemas in `content/config.typ`.
+- External starters and presets through `typage init --starter` and `typage add`.
 - Legacy-compatible TOML front matter via `serde` and `toml`.
 - Per-page `template: "..."` selection.
 - Combined print PDF documents through `[[pdf_documents]]`.
@@ -57,7 +58,7 @@ In the Typst CLI, HTML export can be enabled with `--features html` or `TYPST_FE
 - Optional RSS, Atom, sitemap, and robots outputs.
 - Canonical URL, Open Graph, and Twitter Card metadata in default templates.
 - Full-text `search_index.json` with field scores, heading entries, and CJK-friendly tokenization.
-- Theme-owned Typst components through `@local/typage-theme:0.1.4`.
+- Theme-owned Typst components through `@local/typage-theme:0.1.5`.
 - Built-in shortcodes: `note`, `figure`, and `youtube`.
 - External generator plugins through `typage plugin`.
 - `serve --live-reload`.
@@ -71,7 +72,7 @@ In the Typst CLI, HTML export can be enabled with `--features html` or `TYPST_FE
 - `plugin install`, `plugin list`, `plugin doctor`, and `plugin run`.
 - Deployment scaffolds for GitHub Pages, Cloudflare Pages, Netlify, and Vercel.
 - `run` scripts plus `dev`, `preview`, and `check` aliases.
-- Generated local Typst packages `@local/typage:0.1.4` and `@local/typage-theme:0.1.4`.
+- Generated local Typst packages `@local/typage:0.1.5` and `@local/typage-theme:0.1.5`.
 - Section-local previous and next navigation.
 - HTML/PDF dual-target helpers using `context { ... target() ... }`.
 - Unit tests plus a Typst-backed integration test when `typst` is available.
@@ -87,6 +88,12 @@ typage dev
 ```
 
 `typage init` creates a small general-purpose starter: a home page, an about page, a posts section with one sample article, Typst templates, theme component files, and one stylesheet. It is meant to feel closer to an Astro or Jekyll starter than a blank page, while staying easy to delete or reshape.
+
+Use an external starter when you want a domain-specific project shape:
+
+```sh
+typage init my-docs --starter github:rice8y/typage-starter-typst-docs --install-plugins
+```
 
 Equivalent npm-like form:
 
@@ -118,6 +125,56 @@ typage/
 ```
 
 The starter includes navigation, a posts collection, a reusable base layout, and a reusable list layout. Search, taxonomies, feeds, and deploy scaffolds remain opt-in so the generated site stays small until you need those features.
+
+## Starters And Presets
+
+Starters are file bundles that can also register plugins. They are meant for templates, static assets, theme files, content schemas, and project presets. Because these files are mostly Typage, Typst, CSS, and static assets, they are usually better distributed as Git repositories than as crates.io packages.
+
+Create a project from a starter:
+
+```sh
+typage init my-docs --starter github:rice8y/typage-starter-typst-docs --install-plugins
+typage init my-docs --starter https://github.com/rice8y/typage-starter-typst-docs.git
+typage init my-docs --starter ../typage-starter-typst-docs
+```
+
+Apply a starter or preset to an existing project:
+
+```sh
+typage add github:rice8y/typage-starter-typst-docs --install-plugins
+typage add ../typage-starter-typst-docs --force
+```
+
+Starter repositories can place project files under `files/` and describe plugin registrations in `typage.starter.toml`:
+
+```toml
+name = "typst-docs"
+description = "Typst package API documentation starter."
+min_typage = "0.1.5"
+
+[plugins.typst_docs]
+package = "typage-plugin-typst-docs"
+version = "0.1.0"
+watch = ["package/**/*.typ", "package/typst.toml"]
+outputs = ["content/api"]
+
+[plugins.typst_docs.config]
+source_dir = "package"
+out_dir = "content/api"
+template = "typst-docs.typ"
+```
+
+The `files/` directory is copied into the project root. Existing files are not overwritten unless `--force` is passed. Plugin registrations are merged into `typage.plugins.toml`; `--install-plugins` also installs declared plugin binaries with Cargo when the plugin entry does not use `command`.
+
+Supported starter sources:
+
+```text
+github:owner/repo
+github:owner/repo#tag-or-branch
+https://github.com/owner/repo.git
+git+https://github.com/owner/repo.git
+../local-starter
+```
 
 ## Content Model
 
@@ -192,7 +249,7 @@ Nested directories become nested sections. For example, `content/posts/tutorials
 The generated site package exposes section data:
 
 ```typst
-#import "@local/typage:0.1.4": current, section, children, ancestors, siblings
+#import "@local/typage:0.1.5": current, section, children, ancestors, siblings
 
 #current.updated
 #current.weight
@@ -265,13 +322,13 @@ Components are theme-owned. The SSG core only exposes data, routing, URL helpers
 Use the core package for site data:
 
 ```typst
-#import "@local/typage:0.1.4": site, current, section, taxonomy-url
+#import "@local/typage:0.1.5": site, current, section, taxonomy-url
 ```
 
 Use the active theme package for UI components:
 
 ```typst
-#import "@local/typage-theme:0.1.4": note, callout, card, fig, youtube, page-link, taxonomy-link
+#import "@local/typage-theme:0.1.5": note, callout, card, fig, youtube, page-link, taxonomy-link
 
 #note(title: "Note")[
   This component comes from the active theme.
@@ -322,7 +379,7 @@ theme = "my-theme"
 name = "my-theme"
 version = "0.1.0"
 description = "A typage theme."
-min_typage = "0.1.4"
+min_typage = "0.1.5"
 
 [components]
 note = true
@@ -351,14 +408,14 @@ Component convention:
 
 ```text
 templates/components/
-|-- lib.typ       # entrypoint for @local/typage-theme:0.1.4
+|-- lib.typ       # entrypoint for @local/typage-theme:0.1.5
 |-- callout.typ
 |-- card.typ
 |-- media.typ
 `-- layout.typ
 ```
 
-`typage` copies the active `templates/components/` directory into the generated package `@local/typage-theme:0.1.4`. Project `static/` overrides theme `static/` when both provide the same path.
+`typage` copies the active `templates/components/` directory into the generated package `@local/typage-theme:0.1.5`. Project `static/` overrides theme `static/` when both provide the same path.
 
 ## Plugins
 
@@ -415,11 +472,11 @@ The manifest must print valid JSON. Typage does not install plugins automaticall
 
 ## Site API
 
-`@local/typage:0.1.4` exposes data and non-presentational helpers for content and templates:
+`@local/typage:0.1.5` exposes data and non-presentational helpers for content and templates:
 
 ```typst
-#import "@local/typage:0.1.4": site, current, pages, sections, taxonomies, url, asset, section, children, ancestors, siblings, taxonomy-url, is-current, page-by-url
-#import "@local/typage-theme:0.1.4": page-link, taxonomy-link
+#import "@local/typage:0.1.5": site, current, pages, sections, taxonomies, url, asset, section, children, ancestors, siblings, taxonomy-url, is-current, page-by-url
+#import "@local/typage-theme:0.1.5": page-link, taxonomy-link
 
 = #current.title
 
@@ -444,7 +501,7 @@ taxonomy-url(name, term)
 is-current(page)
 ```
 
-Presentational helpers such as `page-link`, `taxonomy-link`, `note`, `card`, and media embeds belong to `@local/typage-theme:0.1.4`.
+Presentational helpers such as `page-link`, `taxonomy-link`, `note`, `card`, and media embeds belong to `@local/typage-theme:0.1.5`.
 
 ## Directory Policy
 
@@ -697,6 +754,8 @@ typage build
 typage build --force
 typage build --pdf
 typage build --keep-going
+typage init my-docs --starter github:owner/starter
+typage add github:owner/starter
 typage dev
 typage serve --live-reload
 typage preview
@@ -772,7 +831,7 @@ During local development, adjust `cargo install typage --locked` to `cargo insta
 
 ## Notes
 
-`@local/typage:0.1.4` and `@local/typage-theme:0.1.4` are staged under `.typage/packages/local/` and passed to Typst with `--package-path`.
+`@local/typage:0.1.5` and `@local/typage-theme:0.1.5` are staged under `.typage/packages/local/` and passed to Typst with `--package-path`.
 
 Typst HTML Export and Bundle Export are experimental. Typage is designed with that moving target in mind.
 

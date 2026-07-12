@@ -4,6 +4,7 @@ mod deploy;
 mod model;
 mod plugin;
 mod serve;
+mod starter;
 mod term;
 mod util;
 mod watch;
@@ -30,6 +31,28 @@ enum Command {
     Init {
         #[arg(default_value = ".")]
         path: PathBuf,
+        /// Create the project from a starter path, Git URL, or github:owner/repo.
+        #[arg(long)]
+        starter: Option<String>,
+        /// Install plugins declared by the starter manifest.
+        #[arg(long)]
+        install_plugins: bool,
+        /// Overwrite files or plugin registrations created by the starter.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Apply a starter or preset to an existing project.
+    Add {
+        /// Starter path, Git URL, or github:owner/repo.
+        source: String,
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        /// Install plugins declared by the starter manifest.
+        #[arg(long)]
+        install_plugins: bool,
+        /// Overwrite files or plugin registrations created by the starter.
+        #[arg(long)]
+        force: bool,
     },
     /// Create a new content page.
     New {
@@ -289,7 +312,34 @@ enum PluginCommand {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Init { path } => build::init_project(&path),
+        Command::Init {
+            path,
+            starter,
+            install_plugins,
+            force,
+        } => {
+            if let Some(source) = starter {
+                starter::init(starter::StarterInitOptions {
+                    root: path,
+                    source,
+                    install_plugins,
+                    force,
+                })
+            } else {
+                build::init_project(&path)
+            }
+        }
+        Command::Add {
+            source,
+            root,
+            install_plugins,
+            force,
+        } => starter::add(starter::StarterAddOptions {
+            root,
+            source,
+            install_plugins,
+            force,
+        }),
         Command::New {
             root,
             path,

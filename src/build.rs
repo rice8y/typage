@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{mpsc, Arc, Mutex};
@@ -28,6 +29,7 @@ use crate::util::{
 const MIN_TYPST_VERSION: (u64, u64, u64) = (0, 15, 0);
 const MIN_TYPST_VERSION_DISPLAY: &str = "0.15.0";
 const TYPAGE_VERSION: &str = env!("CARGO_PKG_VERSION");
+const INLINE_TYPAGE_CURRENT_LIMIT: usize = 32 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct BuildOptions {
@@ -1310,7 +1312,14 @@ pub fn build_site(opts: &BuildOptions) -> Result<BuildStats> {
         );
     }
     let compile_started = Instant::now();
-    let outcomes = run_compile_jobs(&cfg, &root, compile_jobs, compile_concurrency);
+    let mut progress = BuildProgress::new(
+        total_compile_jobs,
+        !opts.quiet && !opts.verbose && total_compile_jobs > 0,
+    );
+    progress.draw();
+    let outcomes = run_compile_jobs(&cfg, &root, compile_jobs, compile_concurrency, || {
+        progress.advance()
+    });
     let compile_wall = compile_started.elapsed();
     let mut reports = Vec::<CompileReport>::new();
     for (job, result) in outcomes {
@@ -1350,6 +1359,7 @@ pub fn build_site(opts: &BuildOptions) -> Result<BuildStats> {
                     eprintln!("  {} {}", term::red("✗"), job.label);
                     failures.push(format!("{}\n{err:?}", job.label));
                 } else {
+                    progress.finish();
                     return Err(err);
                 }
             }
@@ -1357,7 +1367,9 @@ pub fn build_site(opts: &BuildOptions) -> Result<BuildStats> {
     }
 
     for job in print_jobs {
-        match run_print_document_job(&cfg, &root, &job) {
+        let result = run_print_document_job(&cfg, &root, &job);
+        progress.advance();
+        match result {
             Ok(report) => {
                 if !opts.quiet && opts.verbose {
                     println!(
@@ -1384,11 +1396,13 @@ pub fn build_site(opts: &BuildOptions) -> Result<BuildStats> {
                     eprintln!("  {} {}", term::red("✗"), job.label);
                     failures.push(format!("{}\n{err:?}", job.label));
                 } else {
+                    progress.finish();
                     return Err(err);
                 }
             }
         }
     }
+    progress.finish();
 
     for static_root in &static_roots {
         copy_dir(static_root, &out_root)?;
@@ -5070,6 +5084,82 @@ fn format_duration(duration: Duration) -> String {
     }
 }
 
+struct BuildProgress {
+    enabled: bool,
+    total: usize,
+    done: usize,
+    started: Instant,
+    last_draw: Instant,
+    last_len: usize,
+}
+
+impl BuildProgress {
+    fn new(total: usize, enabled: bool) -> Self {
+        let now = Instant::now();
+        Self {
+            enabled,
+            total,
+            done: 0,
+            started: now,
+            last_draw: now,
+            last_len: 0,
+        }
+    }
+
+    fn advance(&mut self) {
+        if self.total > 0 {
+            self.done = (self.done + 1).min(self.total);
+        }
+        if self.enabled
+            && (self.done == self.total || self.last_draw.elapsed() >= Duration::from_millis(100))
+        {
+            self.draw();
+        }
+    }
+
+    fn draw(&mut self) {
+        if !self.enabled {
+            return;
+        }
+        let width = 24usize;
+        let filled = if self.total == 0 {
+            width
+        } else {
+            self.done * width / self.total
+        };
+        let percent = if self.total == 0 {
+            100
+        } else {
+            self.done * 100 / self.total
+        };
+        let bar = format!("{}{}", "=".repeat(filled), " ".repeat(width - filled));
+        let line = format!(
+            "  {} [{}] {}/{} {} {}",
+            term::cyan("compile"),
+            bar,
+            self.done,
+            self.total,
+            term::dim(format!("{percent:>3}%")),
+            term::dim(format_duration(self.started.elapsed()))
+        );
+        let padding = " ".repeat(self.last_len.saturating_sub(line.len()));
+        print!("\r{line}{padding}");
+        let _ = io::stdout().flush();
+        self.last_len = line.len();
+        self.last_draw = Instant::now();
+    }
+
+    fn finish(&mut self) {
+        if self.enabled {
+            if self.done < self.total || self.last_len == 0 {
+                self.draw();
+            }
+            println!();
+            self.enabled = false;
+        }
+    }
+}
+
 fn print_build_summary(
     stats: &BuildStats,
     compile_jobs: usize,
@@ -5154,18 +5244,19 @@ fn run_compile_jobs(
     root: &Path,
     jobs: Vec<CompileJob>,
     concurrency: usize,
+    mut on_complete: impl FnMut(),
 ) -> Vec<(CompileJob, Result<CompileReport>)> {
     if jobs.is_empty() {
         return Vec::new();
     }
     if concurrency <= 1 {
-        return jobs
-            .into_iter()
-            .map(|job| {
-                let result = run_compile_job(cfg, root, &job);
-                (job, result)
-            })
-            .collect();
+        let mut outcomes = Vec::with_capacity(jobs.len());
+        for job in jobs {
+            let result = run_compile_job(cfg, root, &job);
+            on_complete();
+            outcomes.push((job, result));
+        }
+        return outcomes;
     }
 
     let (job_tx, job_rx) = mpsc::channel::<CompileJob>();
@@ -5193,12 +5284,51 @@ fn run_compile_jobs(
     }
     drop(job_tx);
 
-    out_rx.into_iter().collect()
+    let mut outcomes = Vec::new();
+    for outcome in out_rx {
+        on_complete();
+        outcomes.push(outcome);
+    }
+    outcomes
+}
+
+fn current_input_args(
+    root: &Path,
+    cfg: &Config,
+    cache_key: &str,
+    current_json: &str,
+) -> Result<Vec<(String, String)>> {
+    if current_json.len() <= INLINE_TYPAGE_CURRENT_LIMIT {
+        return Ok(vec![(
+            "typage_current".to_string(),
+            current_json.to_string(),
+        )]);
+    }
+
+    let package_root = typage_package_root(root, cfg);
+    let current_dir = package_root.join("current");
+    fs::create_dir_all(&current_dir)?;
+    let filename = format!("{}-{}.json", slugify(cache_key), hash_strs(&[current_json]));
+    let path = current_dir.join(filename);
+    write_if_changed(&path, current_json)?;
+    let current_path = relative_path(&package_root, &path)?;
+    Ok(vec![(
+        "typage_current_file".to_string(),
+        to_posix_path(&current_path),
+    )])
+}
+
+fn input_arg_refs(inputs: &[(String, String)]) -> Vec<(&str, &str)> {
+    inputs
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect()
 }
 
 fn run_compile_job(cfg: &Config, root: &Path, job: &CompileJob) -> Result<CompileReport> {
     let started = Instant::now();
-    let inputs = [("typage_current", job.current_json.as_str())];
+    let inputs = current_input_args(root, cfg, &job.cache_key, &job.current_json)?;
+    let input_refs = input_arg_refs(&inputs);
     compile_typst(
         cfg,
         root,
@@ -5207,7 +5337,7 @@ fn run_compile_job(cfg: &Config, root: &Path, job: &CompileJob) -> Result<Compil
         "html",
         &job.html_features,
         job.label.clone(),
-        &inputs,
+        &input_refs,
     )?;
     if let Some(pdf_output) = &job.pdf_output {
         compile_typst(
@@ -5218,7 +5348,7 @@ fn run_compile_job(cfg: &Config, root: &Path, job: &CompileJob) -> Result<Compil
             "pdf",
             "",
             format!("{} [pdf]", job.label),
-            &inputs,
+            &input_refs,
         )?;
     }
     Ok(CompileReport {
@@ -5235,7 +5365,8 @@ fn run_print_document_job(
     job: &PrintDocumentJob,
 ) -> Result<CompileReport> {
     let started = Instant::now();
-    let inputs = [("typage_current", job.current_json.as_str())];
+    let inputs = current_input_args(root, cfg, &job.cache_key, &job.current_json)?;
+    let input_refs = input_arg_refs(&inputs);
     compile_typst(
         cfg,
         root,
@@ -5244,7 +5375,7 @@ fn run_print_document_job(
         "pdf",
         "",
         job.label.clone(),
-        &inputs,
+        &input_refs,
     )?;
     Ok(CompileReport {
         label: job.label.clone(),
@@ -5299,6 +5430,11 @@ fn page_current_json(page: &Page) -> Result<String> {
 }
 
 fn generated_current_json(gen: &GeneratedPage, cfg: &Config) -> Result<String> {
+    let items = gen
+        .items
+        .iter()
+        .map(page_summary_json)
+        .collect::<Result<Vec<_>>>()?;
     Ok(serde_json::to_string(&json!({
         "kind": &gen.kind,
         "title": &gen.title,
@@ -5323,10 +5459,44 @@ fn generated_current_json(gen: &GeneratedPage, cfg: &Config) -> Result<String> {
         "toc": [],
         "prev": nav_json(&gen.prev_title, &gen.prev_url),
         "next": nav_json(&gen.next_title, &gen.next_url),
-        "items": &gen.items,
+        "items": items,
         "page_number": gen.page_number,
         "total_pages": gen.total_pages,
     }))?)
+}
+
+fn page_summary_json(page: &PageSummary) -> Result<serde_json::Value> {
+    let mut value = json!({
+        "kind": &page.kind,
+        "title": &page.title,
+        "description": &page.description,
+        "excerpt": &page.excerpt,
+        "date": &page.date,
+        "updated": &page.updated,
+        "weight": page.weight,
+        "url": &page.url,
+        "canonical_url": &page.canonical_url,
+        "current_url": &page.url,
+        "slug": &page.slug,
+        "path": &page.path,
+        "file_path": &page.file_path,
+        "source": &page.source,
+        "section": &page.section,
+        "parent_section": &page.parent_section,
+        "ancestors": &page.ancestors,
+        "tags": &page.tags,
+        "categories": &page.categories,
+        "aliases": &page.aliases,
+        "toc": &page.toc,
+    });
+    if let Some(object) = value.as_object_mut() {
+        for (name, field) in &page.fields {
+            if let Some(value) = &field.value {
+                object.insert(name.clone(), serde_json::to_value(value)?);
+            }
+        }
+    }
+    Ok(value)
 }
 
 fn read_cache(path: &Path) -> Result<BuildCache> {
@@ -6297,7 +6467,9 @@ description = "Virtual site data package generated by typage."
     write_if_changed(&pkg_root.join("typst.toml"), &manifest)?;
     let lib = r#"#import "data.typ": site, pages, generated, sections, taxonomies
 
-#let current = json(bytes(sys.inputs.at("typage_current", default: "{}")))
+#let __typage_current_file = sys.inputs.at("typage_current_file", default: none)
+#let __typage_current_raw = if __typage_current_file == none { sys.inputs.at("typage_current", default: "{}") } else { read(__typage_current_file) }
+#let current = json(bytes(__typage_current_raw))
 
 #let url(path) = if site.base_url == "" { path } else { site.base_url + path }
 #let asset = url
@@ -6893,6 +7065,69 @@ mod tests {
         assert_eq!(got.reasons, vec!["no cache entry".to_string()]);
     }
 
+    #[test]
+    fn current_input_args_spills_large_current_into_typage_package() {
+        let tmp =
+            std::env::temp_dir().join(format!("typage-current-input-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let cfg = Config::default();
+        let large_current = format!(
+            "{{\"title\":\"{}\"}}",
+            "x".repeat(INLINE_TYPAGE_CURRENT_LIMIT)
+        );
+
+        let inputs =
+            current_input_args(&tmp, &cfg, "generated:/huge-section/", &large_current).unwrap();
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].0, "typage_current_file");
+        assert!(inputs[0].1.starts_with("current/"));
+        let current_path = typage_package_root(&tmp, &cfg).join(&inputs[0].1);
+        assert_eq!(
+            std::fs::read_to_string(current_path).unwrap(),
+            large_current
+        );
+
+        let small_inputs = current_input_args(&tmp, &cfg, "page:/small/", "{}").unwrap();
+        assert_eq!(
+            small_inputs,
+            vec![("typage_current".to_string(), "{}".to_string())]
+        );
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn generated_current_json_flattens_summary_metadata_fields() {
+        let cfg = Config::default();
+        let mut item = page_summary("Symbol", "/api/lib/symbol/", "api/lib", "2026-01-01");
+        item.fields.insert(
+            "api_module".to_string(),
+            MetadataField {
+                typst: "\"lib\"".to_string(),
+                value: Some(toml::Value::String("lib".to_string())),
+            },
+        );
+        let generated = GeneratedPage {
+            kind: "section".to_string(),
+            title: "lib".to_string(),
+            description: None,
+            url: "/api/lib/".to_string(),
+            output_html: PathBuf::from("public/api/lib/index.html"),
+            items: vec![item],
+            page_number: 1,
+            total_pages: 1,
+            prev_title: None,
+            prev_url: None,
+            next_title: None,
+            next_url: None,
+        };
+
+        let value: serde_json::Value =
+            serde_json::from_str(&generated_current_json(&generated, &cfg).unwrap()).unwrap();
+        let first = value["items"].as_array().unwrap().first().unwrap();
+        assert_eq!(first["api_module"], "lib");
+        assert!(first.get("fields").is_none());
+    }
+
     #[cfg(unix)]
     #[test]
     fn cache_decision_rebuilds_unsafe_output_symlink() {
@@ -6966,6 +7201,7 @@ mod tests {
         let lib = std::fs::read_to_string(pkg.join("lib.typ")).unwrap();
         assert!(lib.contains("sys.inputs.at"));
         assert!(lib.contains("typage_current"));
+        assert!(lib.contains("typage_current_file"));
         assert!(lib.contains("#let asset"));
         assert!(lib.contains("#let section"));
         assert!(lib.contains("#let children"));

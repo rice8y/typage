@@ -418,7 +418,7 @@ mod tests {
             starter.join(STARTER_FILE),
             r#"
 name = "demo"
-min_typage = "0.1.4"
+min_typage = "0.1.5"
 
 [plugins.typst_docs]
 package = "typage-plugin-typst-docs"

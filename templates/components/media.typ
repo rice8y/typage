@@ -1,4 +1,4 @@
-#import "@local/typage:0.1.4": url
+#import "@local/typage:0.1.5": url
 
 #let fig(body: none, src: none, alt: "", caption: none) = context {
   if target() == "html" {

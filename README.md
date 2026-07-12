@@ -33,6 +33,7 @@ In the Typst CLI, HTML export can be enabled with `--features html` or `TYPST_FE
 - Build `content/**/*.typ` into `public/**/index.html`.
 - Typst-native metadata directives with `#show: page.with(...)` and `#show: project.with(...)`.
 - Collection schemas in `content/config.typ`.
+- External starters and presets through `typage init --starter` and `typage add`.
 - Legacy-compatible TOML front matter via `serde` and `toml`.
 - Per-page `template: "..."` selection.
 - Combined print PDF documents through `[[pdf_documents]]`.
@@ -88,6 +89,12 @@ typage dev
 
 `typage init` creates a small general-purpose starter: a home page, an about page, a posts section with one sample article, Typst templates, theme component files, and one stylesheet. It is meant to feel closer to an Astro or Jekyll starter than a blank page, while staying easy to delete or reshape.
 
+Use an external starter when you want a domain-specific project shape:
+
+```sh
+typage init my-docs --starter github:rice8y/typage-starter-typst-docs --install-plugins
+```
+
 Equivalent npm-like form:
 
 ```sh
@@ -118,6 +125,56 @@ typage/
 ```
 
 The starter includes navigation, a posts collection, a reusable base layout, and a reusable list layout. Search, taxonomies, feeds, and deploy scaffolds remain opt-in so the generated site stays small until you need those features.
+
+## Starters And Presets
+
+Starters are file bundles that can also register plugins. They are meant for templates, static assets, theme files, content schemas, and project presets. Because these files are mostly Typage, Typst, CSS, and static assets, they are usually better distributed as Git repositories than as crates.io packages.
+
+Create a project from a starter:
+
+```sh
+typage init my-docs --starter github:rice8y/typage-starter-typst-docs --install-plugins
+typage init my-docs --starter https://github.com/rice8y/typage-starter-typst-docs.git
+typage init my-docs --starter ../typage-starter-typst-docs
+```
+
+Apply a starter or preset to an existing project:
+
+```sh
+typage add github:rice8y/typage-starter-typst-docs --install-plugins
+typage add ../typage-starter-typst-docs --force
+```
+
+Starter repositories can place project files under `files/` and describe plugin registrations in `typage.starter.toml`:
+
+```toml
+name = "typst-docs"
+description = "Typst package API documentation starter."
+min_typage = "0.1.4"
+
+[plugins.typst_docs]
+package = "typage-plugin-typst-docs"
+version = "0.1.0"
+watch = ["package/**/*.typ", "package/typst.toml"]
+outputs = ["content/api"]
+
+[plugins.typst_docs.config]
+source_dir = "package"
+out_dir = "content/api"
+template = "typst-docs.typ"
+```
+
+The `files/` directory is copied into the project root. Existing files are not overwritten unless `--force` is passed. Plugin registrations are merged into `typage.plugins.toml`; `--install-plugins` also installs declared plugin binaries with Cargo when the plugin entry does not use `command`.
+
+Supported starter sources:
+
+```text
+github:owner/repo
+github:owner/repo#tag-or-branch
+https://github.com/owner/repo.git
+git+https://github.com/owner/repo.git
+../local-starter
+```
 
 ## Content Model
 
@@ -697,6 +754,8 @@ typage build
 typage build --force
 typage build --pdf
 typage build --keep-going
+typage init my-docs --starter github:owner/starter
+typage add github:owner/starter
 typage dev
 typage serve --live-reload
 typage preview

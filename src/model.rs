@@ -35,10 +35,43 @@ pub struct FrontMatter {
     pub flattened_fields: BTreeMap<String, toml::Value>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct MetadataField {
-    pub typst: String,
-    pub value: Option<toml::Value>,
+    pub key: String,
+    pub native: typst::foundations::Value,
+}
+
+impl MetadataField {
+    pub fn native(key: String, native: typst::foundations::Value) -> Self {
+        Self { key, native }
+    }
+    pub fn from_toml(value: toml::Value) -> Self {
+        let key = crate::compiler::fingerprint(value.to_string().as_bytes());
+        Self::native(key, crate::metadata::from_toml(&value))
+    }
+    pub fn export_json(&self) -> Option<serde_json::Value> {
+        crate::metadata::export_json(&self.native)
+    }
+    pub fn export_toml(&self) -> Option<toml::Value> {
+        self.export_json()
+            .and_then(|v| serde_json::from_value(v).ok())
+    }
+    pub fn expression(&self) -> String {
+        format!(
+            "__typage_values.at({})",
+            crate::util::typst_string(&self.key)
+        )
+    }
+    pub fn current_marker(&self) -> serde_json::Value {
+        serde_json::json!({"__typage_native": self.key})
+    }
+}
+
+impl Serialize for MetadataField {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use typst::foundations::Repr;
+        (&self.key, self.native.repr().as_str()).serialize(serializer)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,7 +110,7 @@ pub struct Page {
     pub next_url: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct PageSummary {
     pub kind: String,
     pub title: String,

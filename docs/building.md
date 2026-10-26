@@ -37,6 +37,8 @@ out_dir = "dist"
 
 `doctor` and `build` reject dangerous layouts such as `out_dir == static_dir`, `out_dir` inside `content_dir`, or `out_dir` containing source/cache directories.
 
+All public output paths are validated before compilation. Content, aliases, generated lists, enabled PDFs, feeds, search, sitemap, robots, and static assets must not collide, including file/directory conflicts. Project static files may override theme static files at the same path.
+
 ## Build Output and Profiling
 
 Default output is compact and colored. Use `NO_COLOR=1` to disable ANSI colors.

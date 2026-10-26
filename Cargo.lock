@@ -2900,6 +2900,7 @@ dependencies = [
  "toml 0.9.12+spec-1.1.0",
  "typst",
  "typst-bundle",
+ "typst-eval",
  "typst-html",
  "typst-kit",
  "typst-layout",

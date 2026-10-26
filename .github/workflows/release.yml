@@ -17,10 +17,6 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - uses: typst-community/setup-typst@v4
-        with:
-          typst-version: 0.15.0
-
       - name: Test
         run: cargo test --locked
 

@@ -1,6 +1,6 @@
 use std::ffi::OsStr;
 use std::fs;
-use std::io::{BufReader, Read};
+use std::io::{BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -10,7 +10,14 @@ pub fn normalize_path(path: &Path) -> Result<PathBuf> {
     if path.exists() {
         fs::canonicalize(path).with_context(|| format!("failed to canonicalize {}", path.display()))
     } else {
-        Ok(std::env::current_dir()?.join(path))
+        let absolute = std::env::current_dir()?.join(path);
+        let ancestor = absolute
+            .ancestors()
+            .find(|path| path.exists())
+            .context("path has no existing ancestor")?;
+        Ok(ancestor
+            .canonicalize()?
+            .join(absolute.strip_prefix(ancestor)?))
     }
 }
 
@@ -18,17 +25,15 @@ pub fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
     if !src.exists() {
         return Ok(());
     }
-    for entry in walkdir::WalkDir::new(src) {
+    for entry in walkdir::WalkDir::new(src).follow_root_links(false) {
         let entry = entry?;
         let from = entry.path();
         let rel = from.strip_prefix(src)?;
         let to = dst.join(rel);
         if entry.file_type().is_dir() {
+            check_output_ancestors(&to.join(".probe"))?;
             fs::create_dir_all(&to)?;
         } else if entry.file_type().is_file() {
-            if let Some(parent) = to.parent() {
-                fs::create_dir_all(parent)?;
-            }
             copy_file_if_changed(from, &to)?;
         }
     }
@@ -36,6 +41,7 @@ pub fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
 }
 
 fn copy_file_if_changed(from: &Path, to: &Path) -> Result<()> {
+    check_output_ancestors(to)?;
     let src_meta = fs::symlink_metadata(from)?;
     if !src_meta.file_type().is_file() {
         return Ok(());
@@ -44,8 +50,7 @@ fn copy_file_if_changed(from: &Path, to: &Path) -> Result<()> {
         Ok(dst_meta) => {
             let dst_type = dst_meta.file_type();
             if dst_type.is_symlink() {
-                fs::remove_file(to)
-                    .with_context(|| format!("failed to remove stale symlink {}", to.display()))?;
+                // The final rename replaces the link without following it.
             } else if dst_type.is_file() {
                 if src_meta.len() == dst_meta.len() && files_equal(from, to)? {
                     return Ok(());
@@ -63,8 +68,10 @@ fn copy_file_if_changed(from: &Path, to: &Path) -> Result<()> {
                 .with_context(|| format!("failed to inspect static output {}", to.display()));
         }
     }
-    fs::copy(from, to)
-        .with_context(|| format!("failed to copy {} to {}", from.display(), to.display()))?;
+    let mut file = temporary_output(to)?;
+    std::io::copy(&mut fs::File::open(from)?, file.as_file_mut())?;
+    file.as_file().set_permissions(src_meta.permissions())?;
+    persist_output(file, to)?;
     Ok(())
 }
 
@@ -97,15 +104,18 @@ pub fn remove_dir_if_exists(path: &Path) -> Result<()> {
 }
 
 pub fn write_if_changed(path: &Path, contents: &str) -> Result<()> {
+    write_bytes_if_changed(path, contents.as_bytes())
+}
+
+pub fn write_bytes_if_changed(path: &Path, contents: &[u8]) -> Result<()> {
+    check_output_ancestors(path)?;
     match fs::symlink_metadata(path) {
         Ok(meta) => {
             let file_type = meta.file_type();
             if file_type.is_symlink() {
-                fs::remove_file(path).with_context(|| {
-                    format!("failed to remove stale symlink {}", path.display())
-                })?;
+                // Do not open the symlink, even when its target has equal bytes.
             } else if file_type.is_file() {
-                if fs::read_to_string(path).unwrap_or_default() == contents {
+                if fs::read(path).is_ok_and(|existing| existing == contents) {
                     return Ok(());
                 }
             } else {
@@ -117,10 +127,61 @@ pub fn write_if_changed(path: &Path, contents: &str) -> Result<()> {
             return Err(err).with_context(|| format!("failed to inspect {}", path.display()));
         }
     }
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+    let mut file = temporary_output(path)?;
+    file.write_all(contents)?;
+    persist_output(file, path)
+}
+
+pub fn check_output_ancestors(path: &Path) -> Result<()> {
+    for ancestor in path.parent().into_iter().flat_map(Path::ancestors) {
+        if ancestor.as_os_str().is_empty() {
+            continue;
+        }
+        match fs::symlink_metadata(ancestor) {
+            Ok(meta) if meta.file_type().is_symlink() => bail!(
+                "refusing to write through output directory symlink {}",
+                ancestor.display()
+            ),
+            Ok(meta) if !meta.is_dir() => {
+                bail!("output parent is not a directory: {}", ancestor.display())
+            }
+            Ok(_) => (),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => (),
+            Err(err) => return Err(err.into()),
+        }
     }
-    fs::write(path, contents).with_context(|| format!("failed to write {}", path.display()))
+    Ok(())
+}
+
+pub fn create_dir_all_checked(path: impl AsRef<Path>) -> Result<()> {
+    let path = path.as_ref();
+    check_output_ancestors(&path.join(".probe"))?;
+    fs::create_dir_all(path)?;
+    Ok(())
+}
+
+fn temporary_output(path: &Path) -> Result<tempfile::NamedTempFile> {
+    check_output_ancestors(path)?;
+    let parent = path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    fs::create_dir_all(parent)?;
+    let file = tempfile::NamedTempFile::new_in(parent)?;
+    if let Ok(meta) = fs::symlink_metadata(path) {
+        if meta.is_file() {
+            file.as_file().set_permissions(meta.permissions())?;
+        }
+    }
+    Ok(file)
+}
+
+fn persist_output(file: tempfile::NamedTempFile, path: &Path) -> Result<()> {
+    check_output_ancestors(path)?;
+    file.as_file().sync_all()?;
+    file.persist(path)
+        .with_context(|| format!("failed to publish {}", path.display()))?;
+    Ok(())
 }
 
 pub fn hash_strs(parts: &[&str]) -> String {
@@ -276,11 +337,28 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn writes_and_copies_reject_parent_symlinks_without_touching_targets() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let link = root.path().join("redirect");
+        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+        assert!(write_if_changed(&link.join("new/file.txt"), "unsafe").is_err());
+        let source = root.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("file.txt"), "unsafe").unwrap();
+        assert!(copy_dir(&source, &link).is_err());
+        assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn copy_dir_skips_symlinks() {
         use std::os::unix::fs::symlink;
 
-        let tmp =
-            std::env::temp_dir().join(format!("typage-copy-link-test-{}", std::process::id()));
+        let tmp = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("typage-copy-link-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
         let src = tmp.join("src");
         let dst = tmp.join("dst");
@@ -300,8 +378,10 @@ mod tests {
     fn copy_dir_replaces_destination_symlink_with_regular_file() {
         use std::os::unix::fs::symlink;
 
-        let tmp =
-            std::env::temp_dir().join(format!("typage-copy-dst-link-test-{}", std::process::id()));
+        let tmp = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("typage-copy-dst-link-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
         let src = tmp.join("src");
         let dst = tmp.join("dst");
@@ -328,7 +408,7 @@ mod tests {
     fn copy_dir_replaces_dangling_destination_symlink_with_regular_file() {
         use std::os::unix::fs::symlink;
 
-        let tmp = std::env::temp_dir().join(format!(
+        let tmp = std::env::temp_dir().canonicalize().unwrap().join(format!(
             "typage-copy-dangling-link-test-{}",
             std::process::id()
         ));
@@ -357,8 +437,10 @@ mod tests {
     fn write_if_changed_replaces_symlink_without_touching_target() {
         use std::os::unix::fs::symlink;
 
-        let tmp =
-            std::env::temp_dir().join(format!("typage-write-link-test-{}", std::process::id()));
+        let tmp = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("typage-write-link-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp).unwrap();
         let outside = tmp.join("outside.txt");
@@ -380,7 +462,7 @@ mod tests {
     fn write_if_changed_replaces_dangling_symlink_without_creating_target() {
         use std::os::unix::fs::symlink;
 
-        let tmp = std::env::temp_dir().join(format!(
+        let tmp = std::env::temp_dir().canonicalize().unwrap().join(format!(
             "typage-write-dangling-link-test-{}",
             std::process::id()
         ));

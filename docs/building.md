@@ -12,7 +12,7 @@ System fonts and Typst's standard embedded fonts are available. Additional fonts
 
 `TYPST_PACKAGE_PATH`, `TYPST_PACKAGE_CACHE_PATH`, and `TYPST_CERT` customize package locations and the HTTPS certificate. Relative paths are resolved from the project root. `SOURCE_DATE_EPOCH` fixes Typst's current date and PDF creation timestamp for reproducible builds. Experimental features are configured with `features` and `bundle_features` in `config.toml`.
 
-Each compile job has its own sources and inputs; fonts and package loading are shared within a build. File reads are restricted to the project or the imported package's root, including symlink checks. Compiler upgrades invalidate the build cache. After changing installed fonts or external package contents, use `typage build --force`.
+Each compile job has its own sources and inputs; fonts and package loading are shared within a build. File reads are restricted to the project or the imported package's root, including symlink checks. The cache records actual Typst source and file reads, including dynamic paths and imported packages, and hashes binary contents without text conversion. Changed or deleted dependencies invalidate cached outputs; `--explain` identifies them. Compiler upgrades also invalidate the cache. After changing installed fonts, use `typage build --force`.
 
 ## Directory Policy
 

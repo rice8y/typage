@@ -12,10 +12,10 @@ An experimental static site generator with Typst content and templates, powered 
 
 ## Quick Start
 
-Install from this repository:
+Install from crates.io:
 
 ```sh
-cargo install --git https://github.com/rice8y/typage --locked
+cargo install typage --locked
 typage init my-site
 cd my-site
 typage dev

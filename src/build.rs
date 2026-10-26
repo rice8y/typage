@@ -74,6 +74,7 @@ type ContentCollections = Arc<crate::metadata::MetadataContext>;
 
 #[derive(Debug, Clone)]
 struct CompileJob {
+    context: compiler::EvaluationContext,
     label: String,
     input: PathBuf,
     html_output: PathBuf,
@@ -88,6 +89,7 @@ struct CompileJob {
 
 #[derive(Debug, Clone)]
 struct PrintDocumentJob {
+    context: compiler::EvaluationContext,
     label: String,
     input: PathBuf,
     output_pdf: PathBuf,
@@ -568,6 +570,7 @@ fn build_site_in_session(opts: &BuildOptions, session: &mut BuildSession) -> Res
         let wrapper = page_wrapper_source(&root, &cfg, &data_path, page, &wrapper_path)?;
         write_if_changed(&wrapper_path, &wrapper)?;
         compile_jobs.push(CompileJob {
+            context: page_evaluation_context(std::slice::from_ref(page)),
             label: page.source.display().to_string(),
             input: wrapper_path,
             html_output: page.output_html.clone(),
@@ -615,6 +618,7 @@ fn build_site_in_session(opts: &BuildOptions, session: &mut BuildSession) -> Res
             hash,
             outputs,
             generated: true,
+            context: compiler::EvaluationContext::default(),
         });
     }
 
@@ -870,12 +874,15 @@ pub fn bundle_site(root: PathBuf, drafts: bool) -> Result<()> {
         .tempdir_in(&cache_root)?;
     compile_typst(
         &compiler,
-        &bundle_path,
-        staged.path(),
+        compiler::CompileRequest {
+            input: &bundle_path,
+            output: staged.path(),
+            format: "bundle",
+            features: &cfg.bundle_features,
+            inputs: &bundle_inputs,
+        },
+        &page_evaluation_context(&pages),
         "bundle",
-        &cfg.bundle_features,
-        "bundle".to_string(),
-        &bundle_inputs,
     )?;
     copy_dir(staged.path(), &out_root)?;
     println!("bundle output: {}", out_root.display());
@@ -2240,22 +2247,28 @@ fn run_compile_job(
     let input_refs = input_arg_refs(&inputs);
     let mut dependencies = compile_typst(
         compiler,
-        &job.input,
-        &job.html_output,
-        "html",
-        &job.html_features,
-        job.label.clone(),
-        &input_refs,
+        compiler::CompileRequest {
+            input: &job.input,
+            output: &job.html_output,
+            format: "html",
+            features: &job.html_features,
+            inputs: &input_refs,
+        },
+        &job.context,
+        &job.label,
     )?;
     if let Some(pdf_output) = &job.pdf_output {
         dependencies.extend(compile_typst(
             compiler,
-            &job.input,
-            pdf_output,
-            "pdf",
-            "",
-            format!("{} [pdf]", job.label),
-            &input_refs,
+            compiler::CompileRequest {
+                input: &job.input,
+                output: pdf_output,
+                format: "pdf",
+                features: "",
+                inputs: &input_refs,
+            },
+            &job.context,
+            &format!("{} [pdf]", job.label),
         )?);
     }
     Ok(CompileReport {
@@ -2278,12 +2291,15 @@ fn run_print_document_job(
     let input_refs = input_arg_refs(&inputs);
     let dependencies = compile_typst(
         compiler,
-        &job.input,
-        &job.output_pdf,
-        "pdf",
-        "",
-        job.label.clone(),
-        &input_refs,
+        compiler::CompileRequest {
+            input: &job.input,
+            output: &job.output_pdf,
+            format: "pdf",
+            features: "",
+            inputs: &input_refs,
+        },
+        &job.context,
+        &job.label,
     )?;
     Ok(CompileReport {
         label: job.label.clone(),
@@ -2431,8 +2447,14 @@ fn cfg_hash(cfg: &Config) -> String {
             std::env::var_os(key).map(|value| value.to_string_lossy().into_owned()),
         )
     });
-    serde_json::to_string(&(cfg, TYPAGE_VERSION, "embedded", compiler::VERSION, env))
-        .unwrap_or_default()
+    serde_json::to_string(&(
+        cfg,
+        TYPAGE_VERSION,
+        "source-context-v1",
+        compiler::VERSION,
+        env,
+    ))
+    .unwrap_or_default()
 }
 
 fn cached_template_hash(
@@ -2473,10 +2495,9 @@ fn page_wrapper_source(
 ) -> Result<String> {
     let wrapper_dir = wrapper_path.parent().unwrap_or(root);
     crate::util::create_dir_all_checked(wrapper_dir)?;
-    let source_dir = page.source.parent().unwrap_or(root);
     let template_path = templates_root(root, cfg).join(&page.template);
     let template_rel = relative_path(wrapper_dir, &template_path)?;
-    let body = rewrite_local_dependency_paths(&page.processed_body, source_dir, wrapper_dir)?;
+    let body = page_include(root, page)?;
     let current = page_dict(page);
     Ok(format!(
         "#import {}: render\n#import \"@local/typage:{TYPAGE_VERSION}\" as typage\n\n#let __typage_current = {}\n#show: render.with(site: typage.site, page: __typage_current, pages: typage.pages, taxonomies: typage.taxonomies)\n\n{}\n",
@@ -2486,82 +2507,26 @@ fn page_wrapper_source(
     ))
 }
 
-fn rewrite_local_dependency_paths(
-    body: &str,
-    source_dir: &Path,
-    target_dir: &Path,
-) -> Result<String> {
-    let mut out = String::new();
-    let mut raw_fence_len = None;
-    for line in body.lines() {
-        if let Some(fence_len) = line_raw_fence_len(line) {
-            match raw_fence_len {
-                Some(open_len) if fence_len >= open_len => raw_fence_len = None,
-                None => raw_fence_len = Some(fence_len),
-                _ => {}
-            }
-            out.push_str(line);
-            out.push('\n');
-            continue;
-        }
-        if raw_fence_len.is_some() {
-            out.push_str(line);
-            out.push('\n');
-            continue;
-        }
-        out.push_str(&rewrite_dependency_line(line, source_dir, target_dir)?);
-        out.push('\n');
+fn page_evaluation_context(pages: &[Page]) -> compiler::EvaluationContext {
+    compiler::EvaluationContext {
+        sources: pages
+            .iter()
+            .map(|page| (page.source.clone(), page.processed_body.clone()))
+            .collect(),
     }
-    Ok(out)
 }
 
-fn rewrite_dependency_line(line: &str, source_dir: &Path, target_dir: &Path) -> Result<String> {
-    let mut current = line.to_string();
-    for marker in ["#import", "#include", "read(", "image("] {
-        current = rewrite_dependency_marker(&current, marker, source_dir, target_dir)?;
-    }
-    Ok(current)
-}
-
-fn rewrite_dependency_marker(
-    line: &str,
-    marker: &str,
-    source_dir: &Path,
-    target_dir: &Path,
-) -> Result<String> {
-    let mut out = String::new();
-    let mut rest = line;
-    while let Some(marker_pos) = rest.find(marker) {
-        let (before, after_marker_start) = rest.split_at(marker_pos + marker.len());
-        out.push_str(before);
-        let after_marker = after_marker_start;
-        let Some(first_quote_rel) = after_marker.find('"') else {
-            rest = after_marker;
-            continue;
-        };
-        out.push_str(&after_marker[..first_quote_rel + 1]);
-        let quoted = &after_marker[first_quote_rel + 1..];
-        let Some(second_quote_rel) = quoted.find('"') else {
-            rest = quoted;
-            continue;
-        };
-        let path = &quoted[..second_quote_rel];
-        if is_local_typst_path(path) {
-            let abs = source_dir.join(path);
-            if abs.exists() {
-                let rel = relative_path(target_dir, &abs)?;
-                out.push_str(&to_posix_path(&rel));
-            } else {
-                out.push_str(path);
-            }
-        } else {
-            out.push_str(path);
-        }
-        out.push('"');
-        rest = &quoted[second_quote_rel + 1..];
-    }
-    out.push_str(rest);
-    Ok(out)
+fn page_include(root: &Path, page: &Page) -> Result<String> {
+    let path = page.source.strip_prefix(root).with_context(|| {
+        format!(
+            "content source is outside the project: {}",
+            page.source.display()
+        )
+    })?;
+    Ok(format!(
+        "#include {}\n",
+        typst_string(&format!("/{}", to_posix_path(path)))
+    ))
 }
 
 fn generated_wrapper_source(
@@ -2932,15 +2897,14 @@ description = "Virtual active theme component package generated by typage."
 
 fn compile_typst(
     compiler: &Compiler,
-    input: &Path,
-    output: &Path,
-    format: &str,
-    features: &str,
-    label: String,
-    inputs: &[(&str, &str)],
+    request: compiler::CompileRequest<'_>,
+    context: &compiler::EvaluationContext,
+    label: &str,
 ) -> Result<crate::compiler::Dependencies> {
+    let input = request.input;
+    let output = request.output;
     compiler
-        .compile(input, output, format, features, inputs)
+        .compile_with_context(request, context)
         .with_context(|| {
             format!(
                 "Typst compilation failed for {label}\ninput: {}\noutput: {}",
@@ -2983,8 +2947,7 @@ fn bundle_source(
         out.push_str("  #let __typage_current = current\n");
         out.push_str("  #let asset = path => if site.base_url == \"\" { path } else { site.base_url + path }\n");
         out.push_str("  #show: render.with(site: site, page: current, pages: pages, taxonomies: taxonomies)\n");
-        let source_dir = page.source.parent().unwrap_or(root);
-        let body = rewrite_local_dependency_paths(&page.processed_body, source_dir, &bundle_dir)?;
+        let body = page_include(root, page)?;
         out.push_str(&body);
         out.push_str("\n]\n");
     }

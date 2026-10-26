@@ -5,8 +5,9 @@ use super::outputs::{
 use super::{
     absolute_url, assign_prev_next, build_link_map, cache_decision, cached_template_hash,
     compare_pages_for_sort, dependency_hash, discover_pages, is_expired_date, is_future_date,
-    page_dict, preprocess_body, print_explain, rewrite_local_dependency_paths, template_hash,
-    templates_root, BuildOptions, ContentCollections, PrintDocumentJob, TYPAGE_VERSION,
+    page_dict, page_evaluation_context, page_include, preprocess_body, print_explain,
+    template_hash, templates_root, BuildOptions, ContentCollections, PrintDocumentJob,
+    TYPAGE_VERSION,
 };
 use crate::config::{Config, PdfDocumentConfig};
 use crate::model::{BuildCache, BuildStats, FrontMatter, Page};
@@ -410,7 +411,21 @@ pub(super) fn prepare_print_document_jobs(
             &wrapper_path,
         )?;
         write_if_changed(&wrapper_path, &wrapper)?;
+        let mut context = page_evaluation_context(&selected_pages);
+        for page in &selected_pages {
+            let body = if doc.section_headings.contains(&page.section) {
+                shift_heading_levels(&page.processed_body, 1)
+            } else {
+                page.processed_body.clone()
+            };
+            // Keep the print-only page binding local to the source being included.
+            context.sources.insert(
+                page.source.clone(),
+                format!("#let page = {}\n{body}", page_dict(page)),
+            );
+        }
         jobs.push(PrintDocumentJob {
+            context,
             label,
             input: wrapper_path,
             output_pdf: output,
@@ -434,7 +449,7 @@ fn print_document_wrapper_path(
 }
 
 /// Places selected bodies in one Typst document using isolated content blocks.
-/// Local resource paths are rebased because the wrapper lives in the cache tree.
+/// Bodies are included at their original paths through compiler source overlays.
 fn print_document_wrapper_source(
     root: &Path,
     cfg: &Config,
@@ -463,17 +478,11 @@ fn print_document_wrapper_source(
     let mut last_heading_section: Option<&str> = None;
 
     for (idx, page) in pages.iter().enumerate() {
-        let source_dir = page.source.parent().unwrap_or(root);
-        let body = rewrite_local_dependency_paths(&page.processed_body, source_dir, wrapper_dir)?;
+        let body = page_include(root, page)?;
         let has_section_heading = doc
             .section_headings
             .iter()
             .any(|section| section == &page.section);
-        let body = if has_section_heading {
-            shift_heading_levels(&body, 1)
-        } else {
-            body
-        };
         let title_heading_marks = if has_section_heading {
             &page_heading_marks
         } else {

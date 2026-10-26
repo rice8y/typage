@@ -1,8 +1,10 @@
 //! Embedded Typst compilation, with per-job sources and shared fonts/packages.
 
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{bail, Context, Result};
 use typst::diag::{FileError, FileResult, SourceDiagnostic, SourceResult};
@@ -21,6 +23,22 @@ use typst_kit::packages::{FsPackages, SystemPackages, UniversePackages};
 // Keep this aligned with the exact versions in Cargo.toml. It also invalidates
 // output caches when the compiler changes independently of Typage's version.
 pub const VERSION: &str = "0.15.1";
+
+pub type Dependencies = BTreeMap<PathBuf, Option<String>>;
+
+pub fn fingerprint(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+pub fn changed_dependencies(dependencies: &Dependencies) -> Vec<PathBuf> {
+    dependencies
+        .iter()
+        .filter_map(|(path, expected)| {
+            let actual = fs::read(path).ok().map(|bytes| fingerprint(&bytes));
+            (actual != *expected).then(|| path.clone())
+        })
+        .collect()
+}
 
 pub struct Compiler {
     root: PathBuf,
@@ -99,7 +117,7 @@ impl Compiler {
         format: &str,
         features: &str,
         inputs: &[(&str, &str)],
-    ) -> Result<()> {
+    ) -> Result<Dependencies> {
         let world = CompileWorld::new(self, input, features, inputs)?;
         match format {
             "html" => {
@@ -130,7 +148,12 @@ impl Compiler {
             }
             _ => bail!("unsupported Typst output format: {format}"),
         }
-        Ok(())
+        let dependencies = world
+            .dependencies
+            .lock()
+            .expect("dependencies poisoned")
+            .clone();
+        Ok(dependencies)
     }
 
     fn pdf_options(&self) -> typst_pdf::PdfOptions {
@@ -196,6 +219,7 @@ struct CompileWorld<'a> {
     library: LazyHash<Library>,
     files: FileStore<ProjectFiles<'a>>,
     time: Time,
+    dependencies: Arc<Mutex<Dependencies>>,
 }
 
 impl<'a> CompileWorld<'a> {
@@ -224,12 +248,14 @@ impl<'a> CompileWorld<'a> {
             }
             None => Time::system(),
         };
+        let dependencies = Arc::new(Mutex::new(BTreeMap::new()));
         Ok(Self {
             compiler,
             main,
             library: LazyHash::new(library),
-            files: FileStore::new(ProjectFiles(compiler)),
+            files: FileStore::new(ProjectFiles(compiler, dependencies.clone())),
             time,
+            dependencies,
         })
     }
 
@@ -297,7 +323,7 @@ impl DiagnosticWorld for CompileWorld<'_> {
     }
 }
 
-struct ProjectFiles<'a>(&'a Compiler);
+struct ProjectFiles<'a>(&'a Compiler, Arc<Mutex<Dependencies>>);
 
 impl FileLoader for ProjectFiles<'_> {
     fn load(&self, id: FileId) -> FileResult<Bytes> {
@@ -318,6 +344,10 @@ impl FileLoader for ProjectFiles<'_> {
         // FsRoot confines lexical paths. Also prevent symlinks from escaping
         // the project or a package's own root.
         let path = root.resolve(id.vpath())?;
+        self.1
+            .lock()
+            .expect("dependencies poisoned")
+            .insert(path.clone(), None);
         let canonical = path
             .canonicalize()
             .map_err(|err| FileError::from_io(err, &path))?;
@@ -331,9 +361,12 @@ impl FileLoader for ProjectFiles<'_> {
         if !canonical.is_file() {
             return Err(FileError::IsDirectory);
         }
-        fs::read(&canonical)
-            .map(Bytes::new)
-            .map_err(|err| FileError::from_io(err, &path))
+        let bytes = fs::read(&canonical).map_err(|err| FileError::from_io(err, &path))?;
+        self.1
+            .lock()
+            .expect("dependencies poisoned")
+            .insert(path, Some(fingerprint(&bytes)));
+        Ok(Bytes::new(bytes))
     }
 }
 

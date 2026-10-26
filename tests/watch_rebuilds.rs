@@ -89,7 +89,7 @@ fn preserves_changes_during_hooks_and_honors_no_hooks() {
     let mut cfg: toml::Value = toml::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
     cfg["hooks"].as_table_mut().unwrap().insert(
         "post_build".into(),
-            "sh -c 'touch hook-started; sleep 1; touch hook-finished'".into(),
+        "sh -c 'touch hook-started; sleep 1; touch hook-finished'".into(),
     );
     fs::write(&config, toml::to_string(&cfg).unwrap()).unwrap();
     {

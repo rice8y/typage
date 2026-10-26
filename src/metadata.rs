@@ -9,7 +9,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
-use typst::foundations::{Dict, IntoValue, Module, Smart, Value};
+use typst::foundations::{Dict, IntoValue, Module, Repr, Smart, Value};
 use typst_syntax::ast::AstNode;
 use typst_syntax::{ast, LinkedNode};
 
@@ -43,6 +43,7 @@ pub struct MetadataContext {
     helpers: Dict,
     dependencies: Mutex<Dependencies>,
     values: Mutex<Dict>,
+    sources: Mutex<BTreeMap<PathBuf, String>>,
     content_root: PathBuf,
 }
 
@@ -100,6 +101,7 @@ impl MetadataContext {
             helpers,
             dependencies: Mutex::new(dependencies),
             values: Mutex::new(Dict::new()),
+            sources: Mutex::new(BTreeMap::new()),
             content_root: content_root.to_path_buf(),
         })
     }
@@ -114,15 +116,27 @@ impl MetadataContext {
             .clone()
     }
     pub fn hash(&self) -> String {
+        let values = self
+            .values()
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.repr().to_string()))
+            .collect::<BTreeMap<_, _>>();
         fingerprint(
-            serde_json::to_string(&*self.dependencies.lock().expect("dependencies poisoned"))
-                .unwrap()
-                .as_bytes(),
+            serde_json::to_string(&(
+                self.dependencies(),
+                &*self.sources.lock().expect("sources poisoned"),
+                values,
+            ))
+            .unwrap()
+            .as_bytes(),
         )
     }
 
     fn evaluate(&self, path: &Path, source: &str, bindings: &Dict) -> Result<Value> {
-        let (module, deps) = self.compiler.evaluate(path, source, bindings)?;
+        let (module, mut deps) = self.compiler.evaluate(path, source, bindings)?;
+        // The page's body is hashed by its compile job; only its metadata
+        // expression belongs in the shared site graph.
+        deps.remove(&crate::util::normalize_path(path)?);
         self.dependencies
             .lock()
             .expect("dependencies poisoned")
@@ -148,6 +162,9 @@ impl MetadataContext {
             let Some(show) = node.get().cast::<ast::ShowRule>() else {
                 continue;
             };
+            if show.selector().is_some() {
+                continue;
+            }
             let ast::Expr::FuncCall(call) = show.transform() else {
                 continue;
             };
@@ -177,15 +194,28 @@ impl MetadataContext {
             if range.start > 0 && body.as_bytes()[range.start - 1] == b'#' {
                 range.start -= 1;
             }
-            let source = format!("{}#let __typage_result = {}\n", &body[..range.start], args);
+            let args = if args.trim() == "()" { "(:)" } else { &args };
+            let prefix = metadata_prefix(body, range.start);
+            let source = format!("{prefix}#let __typage_result = {args}\n");
+            self.sources
+                .lock()
+                .expect("sources poisoned")
+                .insert(path.to_path_buf(), fingerprint(source.as_bytes()));
             let value = self.evaluate(path, &source, &Dict::new())?;
             let mut output = body.to_string();
+            while body[range.end..].starts_with('\n') {
+                range.end += 1;
+            }
             output.replace_range(range, "");
             (value, output)
         } else {
+            self.sources.lock().expect("sources poisoned").insert(
+                path.to_path_buf(),
+                fingerprint(&normalized.as_bytes()[..normalized.len() - body.len()]),
+            );
             (
                 frontmatter.unwrap_or_else(|| Value::Dict(Dict::new())),
-                body.to_string(),
+                body.trim_start_matches('\n').to_string(),
             )
         };
         let Value::Dict(ref dict) = candidate else {
@@ -269,6 +299,36 @@ impl MetadataContext {
         }
         Ok((meta, output_body))
     }
+}
+
+fn metadata_prefix(body: &str, end: usize) -> String {
+    let prefix = &body[..end];
+    let tree = typst_syntax::parse(prefix);
+    let mut bytes = prefix.as_bytes().to_vec();
+    for node in LinkedNode::new(&tree).children() {
+        let Some(import) = node.get().cast::<ast::ModuleImport>() else {
+            continue;
+        };
+        let ast::Expr::Str(source) = import.source() else {
+            continue;
+        };
+        let source = source.get();
+        if !source.starts_with("@local/typage:") && !source.starts_with("@local/typage-theme:") {
+            continue;
+        }
+        // Generated packages exist only after discovery. Keep these imports in
+        // the page body, but do not evaluate rendering-only imports as metadata.
+        let mut range = node.range();
+        if range.start > 0 && bytes[range.start - 1] == b'#' {
+            range.start -= 1;
+        }
+        for byte in &mut bytes[range] {
+            if *byte != b'\n' && *byte != b'\r' {
+                *byte = b' ';
+            }
+        }
+    }
+    String::from_utf8(bytes).expect("metadata prefix remains UTF-8")
 }
 
 pub fn from_toml(value: &toml::Value) -> Value {

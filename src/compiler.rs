@@ -459,7 +459,6 @@ fn write_output(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 #[cfg(test)]
-
 pub(crate) fn prepare_output_file(path: &Path) -> Result<()> {
     match fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_symlink() => fs::remove_file(path)?,

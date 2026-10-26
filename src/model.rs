@@ -30,9 +30,6 @@ pub struct FrontMatter {
     pub paginate_by: Option<usize>,
     #[serde(default, skip_deserializing)]
     pub fields: BTreeMap<String, MetadataField>,
-    #[serde(flatten)]
-    #[serde(skip_serializing)]
-    pub flattened_fields: BTreeMap<String, toml::Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -45,6 +42,7 @@ impl MetadataField {
     pub fn native(key: String, native: typst::foundations::Value) -> Self {
         Self { key, native }
     }
+    #[cfg(test)]
     pub fn from_toml(value: toml::Value) -> Self {
         let key = crate::compiler::fingerprint(value.to_string().as_bytes());
         Self::native(key, crate::metadata::from_toml(&value))

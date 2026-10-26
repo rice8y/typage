@@ -89,7 +89,7 @@ fn preserves_changes_during_hooks_and_honors_no_hooks() {
     let mut cfg: toml::Value = toml::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
     cfg["hooks"].as_table_mut().unwrap().insert(
         "post_build".into(),
-        "sh -c 'touch hook-started; sleep 1; touch hook-finished'".into(),
+        "sh -c 'touch hook-started; sleep 1; echo done >> hook-finished'".into(),
     );
     fs::write(&config, toml::to_string(&cfg).unwrap()).unwrap();
     {
@@ -112,9 +112,27 @@ fn preserves_changes_during_hooks_and_honors_no_hooks() {
                 "Changed during build hook",
             )
         });
-        wait_for("hook completion", || root.join("hook-finished").exists());
+        wait_for("both hook completions", || {
+            fs::read_to_string(root.join("hook-finished"))
+                .is_ok_and(|text| text.lines().count() >= 2)
+        });
     }
-    fs::remove_file(root.join("hook-started")).unwrap();
+    let no_hooks = tempfile::tempdir().unwrap();
+    let root = no_hooks.path();
+    assert!(Command::new(env!("CARGO_BIN_EXE_typage"))
+        .arg("init")
+        .arg(root)
+        .output()
+        .unwrap()
+        .status
+        .success());
+    let config = root.join("config.toml");
+    let mut cfg: toml::Value = toml::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
+    cfg["hooks"]
+        .as_table_mut()
+        .unwrap()
+        .insert("post_build".into(), "sh -c 'touch hook-unexpected'".into());
+    fs::write(config, toml::to_string(&cfg).unwrap()).unwrap();
     let _child = Running(
         Command::new(env!("CARGO_BIN_EXE_typage"))
             .args(["watch", "--no-hooks", "--root"])
@@ -124,6 +142,9 @@ fn preserves_changes_during_hooks_and_honors_no_hooks() {
             .spawn()
             .unwrap(),
     );
-    thread::sleep(Duration::from_secs(2));
-    assert!(!root.join("hook-started").exists());
+    wait_for("no-hooks initial build", || {
+        root.join("public/about/index.html").exists()
+    });
+    thread::sleep(Duration::from_secs(1));
+    assert!(!root.join("hook-unexpected").exists());
 }

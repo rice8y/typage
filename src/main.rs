@@ -381,8 +381,8 @@ fn main() -> Result<()> {
             drafts,
             pdf,
             jobs,
-            no_hooks: _,
-        } => watch::watch(root, drafts, pdf, jobs),
+            no_hooks,
+        } => watch::watch(root, drafts, pdf, jobs, no_hooks),
         Command::Serve {
             root,
             addr,
@@ -393,20 +393,7 @@ fn main() -> Result<()> {
             no_hooks,
         } => {
             run_hook(&root, "pre_serve", no_hooks)?;
-            let opts = build::BuildOptions {
-                root: root.clone(),
-                drafts,
-                force: false,
-                pdf,
-                keep_going: live_reload,
-                jobs,
-                profile: false,
-                explain: false,
-                quiet: false,
-                verbose: false,
-            };
-            build::build_site(&opts)?;
-            let result = serve::serve(root.clone(), addr, live_reload, drafts, pdf, jobs);
+            let result = serve::serve(root.clone(), addr, live_reload, drafts, pdf, jobs, no_hooks);
             if result.is_ok() {
                 run_hook(&root, "post_serve", no_hooks)?;
             }

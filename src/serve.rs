@@ -5,15 +5,13 @@ use std::io::{self, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::channel;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::thread;
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::{Duration, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use notify::{RecursiveMode, Watcher};
 
-use crate::build::{self, BuildOptions};
+use crate::build::BuildOptions;
 use crate::config::load_config;
 use crate::util::{normalize_path, percent_decode};
 
@@ -52,26 +50,62 @@ pub fn serve(
     drafts: bool,
     pdf: bool,
     jobs: Option<usize>,
+    no_hooks: bool,
 ) -> Result<()> {
     let root = normalize_path(&root)?;
     let cfg = load_config(&root)?;
+    let opts = BuildOptions {
+        root: root.clone(),
+        drafts,
+        pdf,
+        jobs,
+        force: false,
+        keep_going: live_reload,
+        profile: false,
+        explain: false,
+        quiet: false,
+        verbose: false,
+    };
+    let mut session = if live_reload {
+        Some(crate::watch::WatchSession::new(opts.clone(), no_hooks)?)
+    } else {
+        None
+    };
+    if let Some(session) = &mut session {
+        session.rebuild()?;
+    } else {
+        crate::run_hook(&root, "pre_build", no_hooks)?;
+        crate::build::build_site(&opts)?;
+        crate::run_hook(&root, "post_build", no_hooks)?;
+    }
     let public = fs::canonicalize(root.join(cfg.out_dir))
         .with_context(|| "failed to canonicalize output directory before serving")?;
+    let public = Arc::new(RwLock::new(public));
     let revision = Arc::new(AtomicU64::new(1));
-    if live_reload {
-        start_live_rebuild_thread(root.clone(), revision.clone(), drafts, pdf, jobs);
-    };
     let listener = TcpListener::bind(&addr)?;
+    if let Some(session) = session {
+        let revision = revision.clone();
+        let public = public.clone();
+        thread::spawn(move || {
+            if let Err(err) = session.run(|path| {
+                *public.write().expect("public path poisoned") = path;
+                revision.fetch_add(1, Ordering::SeqCst);
+                println!("live reload revision updated");
+            }) {
+                eprintln!("live reload stopped: {err:?}");
+            }
+        });
+    }
     println!(
         "serving {} at http://{}{}",
-        public.display(),
+        public.read().expect("public path poisoned").display(),
         addr,
         if live_reload { " with live reload" } else { "" }
     );
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                let public = public.clone();
+                let public = public.read().expect("public path poisoned").clone();
                 let revision = revision.clone();
                 thread::spawn(move || {
                     if let Err(err) = handle_client(stream, &public, live_reload, &revision) {
@@ -83,93 +117,6 @@ pub fn serve(
         }
     }
     Ok(())
-}
-
-fn start_live_rebuild_thread(
-    root: PathBuf,
-    revision: Arc<AtomicU64>,
-    drafts: bool,
-    pdf: bool,
-    jobs: Option<usize>,
-) {
-    thread::spawn(move || {
-        let cfg = match load_config(&root) {
-            Ok(cfg) => cfg,
-            Err(err) => {
-                eprintln!("live reload disabled: failed to load config: {err:?}");
-                return;
-            }
-        };
-        let (tx, rx) = channel();
-        let mut watcher = match notify::recommended_watcher(move |res| {
-            let _ = tx.send(res);
-        }) {
-            Ok(w) => w,
-            Err(err) => {
-                eprintln!("live reload disabled: failed to create watcher: {err}");
-                return;
-            }
-        };
-        for path in [&cfg.content_dir, &cfg.templates_dir, &cfg.static_dir] {
-            let full = root.join(path);
-            if full.exists() {
-                if let Err(err) = watcher.watch(&full, RecursiveMode::Recursive) {
-                    eprintln!("warning: failed to watch {}: {err}", full.display());
-                }
-            }
-        }
-        if let Some(theme) = cfg.theme.as_deref().filter(|s| !s.trim().is_empty()) {
-            let full = root.join("themes").join(theme);
-            if full.exists() {
-                if let Err(err) = watcher.watch(&full, RecursiveMode::Recursive) {
-                    eprintln!("warning: failed to watch {}: {err}", full.display());
-                }
-            }
-        }
-        for full in crate::plugin::watch_roots(&root, &cfg) {
-            if full.exists() {
-                if let Err(err) = watcher.watch(&full, RecursiveMode::Recursive) {
-                    eprintln!("warning: failed to watch {}: {err}", full.display());
-                }
-            }
-        }
-        let mut last = Instant::now() - Duration::from_secs(10);
-        loop {
-            match rx.recv() {
-                Ok(Ok(_event)) => {
-                    if last.elapsed() < Duration::from_millis(250) {
-                        continue;
-                    }
-                    last = Instant::now();
-                    println!("change detected; rebuilding");
-                    let opts = BuildOptions {
-                        root: root.clone(),
-                        drafts,
-                        force: false,
-                        pdf,
-                        keep_going: true,
-                        jobs,
-                        profile: false,
-                        explain: false,
-                        quiet: false,
-                        verbose: false,
-                    };
-                    match build::build_site(&opts) {
-                        Ok(_) => {
-                            revision.fetch_add(1, Ordering::SeqCst);
-                            println!("live reload revision updated");
-                        }
-                        Err(err) => eprintln!("build failed: {err:?}"),
-                    }
-                }
-                Ok(Err(err)) => eprintln!("watch error: {err}"),
-                Err(err) => {
-                    eprintln!("watch channel closed: {err}");
-                    return;
-                }
-            }
-        }
-    });
 }
 
 fn handle_client(

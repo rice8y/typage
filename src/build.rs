@@ -1034,6 +1034,44 @@ fn remove_page_wrappers(content_root: &Path) -> Result<()> {
 }
 
 pub fn build_site(opts: &BuildOptions) -> Result<BuildStats> {
+    BuildSession::default().build(opts)
+}
+
+#[derive(Default)]
+pub struct BuildSession {
+    compiler: Option<(String, Arc<Compiler>)>,
+}
+
+impl BuildSession {
+    pub fn build(&mut self, opts: &BuildOptions) -> Result<BuildStats> {
+        if opts.force {
+            self.compiler = None;
+        }
+        let result = build_site_in_session(opts, self);
+        comemo::evict(10);
+        result
+    }
+
+    fn compiler(&mut self, root: &Path, cfg: &Config) -> Result<Arc<Compiler>> {
+        let key = format!("{}:{}", root.display(), cfg_hash(cfg));
+        if self
+            .compiler
+            .as_ref()
+            .is_none_or(|(previous, _)| previous != &key)
+        {
+            self.compiler = Some((
+                key,
+                Arc::new(Compiler::new(
+                    root,
+                    root.join(&cfg.cache_dir).join("packages"),
+                )?),
+            ));
+        }
+        Ok(self.compiler.as_ref().unwrap().1.clone())
+    }
+}
+
+fn build_site_in_session(opts: &BuildOptions, session: &mut BuildSession) -> Result<BuildStats> {
     let root = normalize_path(&opts.root)?;
     let cfg = load_config(&root)?;
     compiler::features(&cfg.features)?;
@@ -1256,7 +1294,7 @@ pub fn build_site(opts: &BuildOptions) -> Result<BuildStats> {
         !opts.quiet && !opts.verbose && total_compile_jobs > 0,
     );
     progress.draw();
-    let compiler = Arc::new(Compiler::new(&root, cache_root.join("packages"))?);
+    let compiler = session.compiler(&root, &cfg)?;
     let outcomes = run_compile_jobs(
         &cfg,
         &root,

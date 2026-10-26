@@ -14,6 +14,12 @@ System fonts and Typst's standard embedded fonts are available. Additional fonts
 
 Each compile job has its own sources and inputs; fonts and package loading are shared within a build. File reads are restricted to the project or the imported package's root, including symlink checks. The cache records actual Typst source and file reads, including dynamic paths and imported packages, and hashes binary contents without text conversion. Changed or deleted dependencies invalidate cached outputs; `--explain` identifies them. Compiler upgrades also invalidate the cache. After changing installed fonts, use `typage build --force`.
 
+## Watch and Live Reload
+
+`typage watch` and `typage serve --live-reload` share a build session. Saves are debounced after the last change, and changes arriving during compilation remain queued. The session watches configuration files, plugin configuration, source directories (including newly created directories), and recorded compiler dependencies. Configuration changes take effect on the next build, including a changed output directory in live preview.
+
+Fonts and package loaders are reused while compiler configuration is unchanged; sources are loaded afresh per compile. Both modes run `pre_build` and `post_build` hooks unless `--no-hooks` is supplied. A failed rebuild does not advance the live-reload revision.
+
 ## Directory Policy
 
 Default layout:

@@ -94,7 +94,7 @@ Nested directories become nested sections. For example, `content/posts/tutorials
 The generated site package exposes section data:
 
 ```typst
-#import "@local/typage:0.2.0": current, section, children, ancestors, siblings
+#import "@local/typage:0.2.1": current, section, children, ancestors, siblings
 
 #current.updated
 #current.weight

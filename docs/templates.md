@@ -9,13 +9,13 @@ Components are theme-owned. The SSG core only exposes data, routing, URL helpers
 Use the core package for site data:
 
 ```typst
-#import "@local/typage:0.2.0": site, current, section, taxonomy-url
+#import "@local/typage:0.2.1": site, current, section, taxonomy-url
 ```
 
 Use the active theme package for UI components:
 
 ```typst
-#import "@local/typage-theme:0.2.0": note, callout, card, fig, youtube, page-link, taxonomy-link
+#import "@local/typage-theme:0.2.1": note, callout, card, fig, youtube, page-link, taxonomy-link
 
 #note(title: "Note")[
   This component comes from the active theme.
@@ -95,22 +95,22 @@ Component convention:
 
 ```text
 templates/components/
-|-- lib.typ       # entrypoint for @local/typage-theme:0.2.0
+|-- lib.typ       # entrypoint for @local/typage-theme:0.2.1
 |-- callout.typ
 |-- card.typ
 |-- media.typ
 `-- layout.typ
 ```
 
-`typage` copies the active `templates/components/` directory into the generated package `@local/typage-theme:0.2.0`. Project `static/` overrides theme `static/` when both provide the same path.
+`typage` copies the active `templates/components/` directory into the generated package `@local/typage-theme:0.2.1`. Project `static/` overrides theme `static/` when both provide the same path.
 
 ## Site API
 
-`@local/typage:0.2.0` exposes data and non-presentational helpers for content and templates:
+`@local/typage:0.2.1` exposes data and non-presentational helpers for content and templates:
 
 ```typst
-#import "@local/typage:0.2.0": site, current, pages, sections, taxonomies, url, asset, section, children, ancestors, siblings, taxonomy-url, is-current, page-by-url
-#import "@local/typage-theme:0.2.0": page-link, taxonomy-link
+#import "@local/typage:0.2.1": site, current, pages, sections, taxonomies, url, asset, section, children, ancestors, siblings, taxonomy-url, is-current, page-by-url
+#import "@local/typage-theme:0.2.1": page-link, taxonomy-link
 
 = #current.title
 
@@ -135,4 +135,4 @@ taxonomy-url(name, term)
 is-current(page)
 ```
 
-Presentational helpers such as `page-link`, `taxonomy-link`, `note`, `card`, and media embeds belong to `@local/typage-theme:0.2.0`.
+Presentational helpers such as `page-link`, `taxonomy-link`, `note`, `card`, and media embeds belong to `@local/typage-theme:0.2.1`.

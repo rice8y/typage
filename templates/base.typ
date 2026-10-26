@@ -22,7 +22,7 @@
           name: "viewport",
           content: "width=device-width, initial-scale=1",
         ))
-        #html.elem("meta", attrs: (name: "generator", content: "typage 0.2.0"))
+        #html.elem("meta", attrs: (name: "generator", content: "typage 0.2.1"))
         #if site.base_url != "" {
           html.elem("meta", attrs: (
             name: "typage-base-url",

@@ -54,7 +54,8 @@ fn evaluates_imported_schemas_defaults_and_native_template_values() {
 Native body.
 "##;
     let page = root.join("content/projects/native.typ");
-    fs::write(&page, source).unwrap();
+    let source = format!("#import \"@local/typage:{}\" as site-data\n#import \"@local/typage-theme:{}\" as theme\n{source}", env!("CARGO_PKG_VERSION"), env!("CARGO_PKG_VERSION"));
+    fs::write(&page, &source).unwrap();
     fs::write(
         root.join("templates/native.typ"),
         r#"

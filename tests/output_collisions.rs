@@ -28,7 +28,7 @@ fn rejects_collisions_before_publishing_even_without_print_documents() {
         cfg["search"]["enabled"] = true.into();
         fs::write(config, toml::to_string(&cfg).unwrap()).unwrap();
         fs::write(root.join("static").join(relative), "collision").unwrap();
-        for command in ["build", "doctor"] {
+        for command in ["build", "doctor", "bundle"] {
             let result = Command::new(env!("CARGO_BIN_EXE_typage"))
                 .args([command, "--root"])
                 .arg(root)

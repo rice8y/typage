@@ -40,6 +40,18 @@ fn tracks_absolute_dynamic_and_binary_dependencies_across_cache_hits() {
     build(root);
     let cached = build(root);
     assert!(!cached.contains("dependency changed"), "{cached}");
+    let page = root.join("content/about.typ");
+    let body = fs::read_to_string(&page).unwrap();
+    fs::write(page, format!("{body}\nOnly this page changed.\n")).unwrap();
+    let updated = build(root);
+    assert_eq!(
+        updated
+            .lines()
+            .filter(|line| line.contains("rebuild"))
+            .count(),
+        1,
+        "{updated}"
+    );
     fs::write(&partial, "Beta dependency").unwrap();
     assert!(build(root).contains("dependency changed"));
     let output = root.join("public/about/index.html");

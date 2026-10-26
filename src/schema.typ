@@ -31,7 +31,10 @@
       type(value) == std.dictionary and (schema.inner == none or value.values().all(v => __matches(v, schema.inner)))
     } else if kind == "object" {
       let fields = schema.at("fields", default: schema)
-      type(value) == std.dictionary and fields.pairs().all(((name, inner)) => __matches(value.at(name, default: none), inner))
+      type(value) == std.dictionary and fields.pairs().all(((name, inner)) => {
+        let optional-field = type(inner) == std.dictionary and inner.at("kind", default: "") == "optional"
+        (name in value or optional-field) and __matches(value.at(name, default: none), inner)
+      })
     } else if kind == "union" { schema.options.any(inner => __matches(value, inner)) }
     else if kind == "url" {
       type(value) == str and value.contains(regex("^https?://[^\\s/]+(?:/[^\\s]*)?$"))

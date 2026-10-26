@@ -72,9 +72,17 @@ impl ThemeReport {
 #[derive(Debug, Clone, Default)]
 struct ContentCollections {
     collections: BTreeMap<String, CollectionSchema>,
+    runtime: Option<Arc<crate::metadata::MetadataContext>>,
 }
 
 impl ContentCollections {
+    fn parse(&self, path: &Path, raw: &str, section: &str) -> Result<(FrontMatter, String)> {
+        match &self.runtime {
+            Some(runtime) => runtime.parse(path, raw, section),
+            None => split_metadata(path, raw),
+        }
+    }
+
     fn schema_for(&self, section: &str) -> Option<&CollectionSchema> {
         self.collections.get(section).or_else(|| {
             section
@@ -867,8 +875,8 @@ pub fn doctor(root: PathBuf, drafts: bool) -> Result<()> {
     }
     errors.extend(plugin_errors);
 
-    let collections = load_content_collections(&content_root)?;
-    let section_meta = discover_sections(&content_root)?;
+    let collections = load_content_collections(&root, &cfg, &content_root)?;
+    let section_meta = discover_sections(&content_root, &collections)?;
     let (mut pages, skipped) =
         discover_pages(&root, &cfg, &content_root, &out_root, drafts, &collections)?;
     assign_prev_next(&mut pages, &section_meta);
@@ -1111,8 +1119,8 @@ fn build_site_in_session(opts: &BuildOptions, session: &mut BuildSession) -> Res
     crate::plugin::run_build_plugins(&root, &cfg, opts.quiet)?;
 
     let mut cache = read_cache(&cache_path)?;
-    let collections = load_content_collections(&content_root)?;
-    let section_meta = discover_sections(&content_root)?;
+    let collections = load_content_collections(&root, &cfg, &content_root)?;
+    let section_meta = discover_sections(&content_root, &collections)?;
     let (mut pages, skipped) = discover_pages(
         &root,
         &cfg,
@@ -1147,7 +1155,14 @@ fn build_site_in_session(opts: &BuildOptions, session: &mut BuildSession) -> Res
     validate_routes(&pages, &generated)?;
     validate_output_paths(&cfg, &static_roots, &out_root, &pages, &generated, opts.pdf)?;
     let site_data = site_data_typ(&cfg, &summaries, &generated, &section_meta);
-    let site_graph_hash = hash_strs(&[&site_data]);
+    let site_graph_hash = hash_strs(&[
+        &site_data,
+        &collections
+            .runtime
+            .as_ref()
+            .map(|r| r.hash())
+            .unwrap_or_default(),
+    ]);
     write_if_changed(&data_path, &site_data)?;
     write_typage_package_data(&root, &cfg, &site_data)?;
     write_theme_package_data(&root, &cfg)?;
@@ -1308,6 +1323,9 @@ fn build_site_in_session(opts: &BuildOptions, session: &mut BuildSession) -> Res
     );
     progress.draw();
     let compiler = session.compiler(&root, &cfg)?;
+    if let Some(runtime) = &collections.runtime {
+        compiler.set_metadata(runtime.values(), runtime.dependencies());
+    }
     let outcomes = run_compile_jobs(
         &cfg,
         &root,
@@ -1459,8 +1477,8 @@ pub fn bundle_site(root: PathBuf, drafts: bool) -> Result<()> {
     crate::util::create_dir_all_checked(&out_root)?;
     crate::util::create_dir_all_checked(&cache_root)?;
 
-    let collections = load_content_collections(&content_root)?;
-    let section_meta = discover_sections(&content_root)?;
+    let collections = load_content_collections(&root, &cfg, &content_root)?;
+    let section_meta = discover_sections(&content_root, &collections)?;
     let (mut pages, skipped) =
         discover_pages(&root, &cfg, &content_root, &out_root, drafts, &collections)?;
     assign_prev_next(&mut pages, &section_meta);
@@ -1513,6 +1531,9 @@ pub fn bundle_site(root: PathBuf, drafts: bool) -> Result<()> {
         .unwrap_or_else(|| "{}".to_string());
     let bundle_inputs = [("typage_current", bundle_current.as_str())];
     let compiler = Compiler::new(&root, cache_root.join("packages"))?;
+    if let Some(runtime) = &collections.runtime {
+        compiler.set_metadata(runtime.values(), runtime.dependencies());
+    }
     compile_typst(
         &compiler,
         &bundle_path,
@@ -1526,7 +1547,10 @@ pub fn bundle_site(root: PathBuf, drafts: bool) -> Result<()> {
     Ok(())
 }
 
-fn discover_sections(content_root: &Path) -> Result<BTreeMap<String, FrontMatter>> {
+fn discover_sections(
+    content_root: &Path,
+    collections: &ContentCollections,
+) -> Result<BTreeMap<String, FrontMatter>> {
     let mut sections = BTreeMap::new();
     if !content_root.exists() {
         return Ok(sections);
@@ -1542,7 +1566,8 @@ fn discover_sections(content_root: &Path) -> Result<BTreeMap<String, FrontMatter
         }
         let raw = fs::read_to_string(path)
             .with_context(|| format!("failed to read {}", path.display()))?;
-        let (meta, _) = split_metadata(path, &raw)
+        let (meta, _) = collections
+            .parse(path, &raw, "")
             .with_context(|| format!("failed to parse metadata in {}", path.display()))?;
         let parent = path.parent().unwrap_or(content_root);
         let rel = parent.strip_prefix(content_root).unwrap_or(parent);
@@ -2880,7 +2905,7 @@ fn taxonomy_search_text(page: &Page, cfg: &SearchConfig) -> String {
             if matches!(key.as_str(), "tags" | "categories") {
                 continue;
             }
-            let Some(value) = field.value.clone() else {
+            let Some(value) = field.export_toml() else {
                 continue;
             };
             match value {
@@ -3157,7 +3182,8 @@ fn discover_pages(
         }
         let raw = fs::read_to_string(path)
             .with_context(|| format!("failed to read {}", path.display()))?;
-        let (mut meta, body) = split_metadata(path, &raw)
+        let (mut meta, body) = collections
+            .parse(path, &raw, &infer_section(path.strip_prefix(content_root)?))
             .with_context(|| format!("failed to parse metadata in {}", path.display()))?;
         if meta.lang.as_deref().unwrap_or("").trim().is_empty() {
             meta.lang = Some(cfg.lang.clone());
@@ -3259,7 +3285,7 @@ fn validate_page_metadata_schema(
 fn page_metadata_owned_value(meta: &FrontMatter, name: &str) -> Option<toml::Value> {
     meta.fields
         .get(name)
-        .and_then(|field| field.value.clone())
+        .and_then(|field| field.export_toml())
         .or_else(|| core_metadata_owned_value(meta, name))
 }
 
@@ -3430,13 +3456,7 @@ fn normalize_frontmatter_fields(path: &Path, meta: &mut FrontMatter) -> Result<(
             );
         }
         validate_metadata_field_name(path, &name)?;
-        meta.fields.insert(
-            name,
-            MetadataField {
-                typst: typst_value(&value),
-                value: Some(value),
-            },
-        );
+        meta.fields.insert(name, MetadataField::from_toml(value));
     }
     Ok(())
 }
@@ -3462,14 +3482,30 @@ fn apply_metadata_aliases(meta: &mut FrontMatter) {
 }
 
 fn metadata_field_string(field: Option<&MetadataField>) -> Option<String> {
-    match field.and_then(|field| field.value.as_ref()) {
+    match field.and_then(|field| field.export_toml()) {
         Some(toml::Value::String(value)) => Some(value.clone()),
         Some(toml::Value::Datetime(value)) => Some(value.to_string()),
         _ => None,
     }
 }
 
-fn load_content_collections(content_root: &Path) -> Result<ContentCollections> {
+fn load_content_collections(
+    root: &Path,
+    cfg: &Config,
+    content_root: &Path,
+) -> Result<ContentCollections> {
+    Ok(ContentCollections {
+        runtime: Some(Arc::new(crate::metadata::MetadataContext::new(
+            root,
+            content_root,
+            root.join(&cfg.cache_dir).join("packages"),
+        )?)),
+        ..Default::default()
+    })
+}
+
+#[allow(dead_code)]
+fn load_literal_content_collections(content_root: &Path) -> Result<ContentCollections> {
     let path = content_root.join("config.typ");
     if !path.exists() {
         return Ok(ContentCollections::default());
@@ -3507,6 +3543,7 @@ fn load_content_collections(content_root: &Path) -> Result<ContentCollections> {
     }
     Ok(ContentCollections {
         collections: collections.unwrap_or_default(),
+        runtime: None,
     })
 }
 
@@ -3928,7 +3965,13 @@ fn metadata_field(
     let value = metadata_toml_value(path, source, offset, name, expr)
         .ok()
         .flatten();
-    Ok(MetadataField { typst, value })
+    match value {
+        Some(value) => Ok(MetadataField::from_toml(value)),
+        None => bail!(
+            "{}: unsupported metadata expression {typst}",
+            metadata_location(path, source, offset)
+        ),
+    }
 }
 
 fn metadata_optional_string(
@@ -5048,7 +5091,7 @@ fn taxonomy_values(page: &PageSummary, name: &str) -> Vec<String> {
         "categories" => return page.categories.clone(),
         _ => {}
     }
-    match page.fields.get(name).and_then(|field| field.value.as_ref()) {
+    match page.fields.get(name).and_then(|field| field.export_toml()) {
         Some(toml::Value::String(s)) => vec![s.clone()],
         Some(toml::Value::Array(xs)) => xs
             .iter()
@@ -5505,9 +5548,7 @@ fn page_current_json(page: &Page) -> Result<String> {
     });
     if let Some(object) = value.as_object_mut() {
         for (name, field) in &page.meta.fields {
-            if let Some(value) = &field.value {
-                object.insert(name.clone(), serde_json::to_value(value)?);
-            }
+            object.insert(name.clone(), field.current_marker());
         }
     }
     Ok(serde_json::to_string(&value)?)
@@ -5575,9 +5616,7 @@ fn page_summary_json(page: &PageSummary) -> Result<serde_json::Value> {
     });
     if let Some(object) = value.as_object_mut() {
         for (name, field) in &page.fields {
-            if let Some(value) = &field.value {
-                object.insert(name.clone(), serde_json::to_value(value)?);
-            }
+            object.insert(name.clone(), field.current_marker());
         }
     }
     Ok(value)
@@ -6091,7 +6130,7 @@ fn generated_wrapper_source(
 
 fn page_dict(page: &Page) -> String {
     format!(
-        "(kind: \"page\", title: {}, description: {}, excerpt: {}, date: {}, updated: {}, weight: {}, lang: {}, url: {}, canonical_url: {}, current_url: {}, slug: {}, path: {}, file_path: {}, source: {}, section: {}, parent_section: {}, ancestors: {}, tags: {}, categories: {}, aliases: {}, toc: {}, prev: {}, next: {}{})",
+        "(kind: \"page\", title: {}, description: {}, excerpt: {}, date: {}, updated: {}, weight: {}, lang: {}, url: {}, canonical_url: {}, current_url: {}, slug: {}, path: {}, file_path: {}, source: {}, section: {}, parent_section: {}, ancestors: {}, tags: {}, categories: {}, aliases: {}, toc: {}, prev: {}, next: {}){}",
         typst_string(&page.title),
         typst_opt_string(&page.meta.description),
         typst_opt_string(&page.meta.excerpt),
@@ -6331,7 +6370,7 @@ fn generated_page_dict(gen: &GeneratedPage, cfg: &Config) -> String {
 
 fn summary_dict(page: &PageSummary) -> String {
     format!(
-        "(kind: {}, title: {}, url: {}, canonical_url: {}, slug: {}, path: {}, file_path: {}, description: {}, date: {}, updated: {}, weight: {}, section: {}, parent_section: {}, ancestors: {}, tags: {}, categories: {}, aliases: {}, source: {}, excerpt: {}, toc: {}{})",
+        "(kind: {}, title: {}, url: {}, canonical_url: {}, slug: {}, path: {}, file_path: {}, description: {}, date: {}, updated: {}, weight: {}, section: {}, parent_section: {}, ancestors: {}, tags: {}, categories: {}, aliases: {}, source: {}, excerpt: {}, toc: {}){}",
         typst_string(&page.kind),
         typst_string(&page.title),
         typst_string(&page.url),
@@ -6362,10 +6401,10 @@ fn metadata_fields_typst(fields: &BTreeMap<String, MetadataField>) -> String {
     }
     let fields = fields
         .iter()
-        .map(|(name, field)| format!("{}: {}", typst_ident(name), field.typst))
+        .map(|(name, field)| format!("{}: {}", typst_string(name), field.expression()))
         .collect::<Vec<_>>()
         .join(", ");
-    format!(", {fields}")
+    format!(" + ({fields})")
 }
 
 fn typst_ident(key: &str) -> String {
@@ -6516,7 +6555,7 @@ fn sections_dict_typ(
         let parent = parent_section_name(name);
         let ancestors = section_ancestors(name);
         format!(
-            "(name: {}, title: {}, description: {}, path: {}, parent: {}, ancestors: {}, children: {}, pages: {}, sort_by: {}, weight: {}{})",
+            "(name: {}, title: {}, description: {}, path: {}, parent: {}, ancestors: {}, children: {}, pages: {}, sort_by: {}, weight: {}){}",
             typst_string(name),
             typst_string(&meta.and_then(|m| m.title.clone()).unwrap_or_else(|| name.clone())),
             typst_opt_string(&meta.and_then(|m| m.description.clone())),
@@ -6561,7 +6600,14 @@ description = "Virtual site data package generated by typage."
 
 #let __typage_current_file = sys.inputs.at("typage_current_file", default: none)
 #let __typage_current_raw = if __typage_current_file == none { sys.inputs.at("typage_current", default: "{}") } else { read(__typage_current_file) }
-#let current = json(bytes(__typage_current_raw))
+#let __typage_hydrate(value) = {
+  if type(value) == dictionary {
+    if "__typage_native" in value { __typage_values.at(value.__typage_native) }
+    else { value.pairs().fold((:), (result, (key, item)) => { result.insert(key, __typage_hydrate(item)); result }) }
+  } else if type(value) == array { value.map(__typage_hydrate) }
+  else { value }
+}
+#let current = __typage_hydrate(json(bytes(__typage_current_raw)))
 
 #let url(path) = if site.base_url == "" { path } else { site.base_url + path }
 #let asset = url
@@ -7189,10 +7235,7 @@ mod tests {
         let mut item = page_summary("Symbol", "/api/lib/symbol/", "api/lib", "2026-01-01");
         item.fields.insert(
             "api_module".to_string(),
-            MetadataField {
-                typst: "\"lib\"".to_string(),
-                value: Some(toml::Value::String("lib".to_string())),
-            },
+            MetadataField::from_toml(toml::Value::String("lib".to_string())),
         );
         let generated = GeneratedPage {
             kind: "section".to_string(),
@@ -7212,7 +7255,7 @@ mod tests {
         let value: serde_json::Value =
             serde_json::from_str(&generated_current_json(&generated, &cfg).unwrap()).unwrap();
         let first = value["items"].as_array().unwrap().first().unwrap();
-        assert_eq!(first["api_module"], "lib");
+        assert!(first["api_module"]["__typage_native"].is_string());
         assert!(first.get("fields").is_none());
     }
 
@@ -7571,19 +7614,7 @@ Body
 "#;
         let (fm, body) = split_metadata(Path::new("content/hello.typ"), raw).unwrap();
         assert_eq!(body, "Body\n");
-        assert_eq!(
-            fm.fields
-                .get("authors")
-                .and_then(|field| field.value.as_ref())
-                .and_then(|value| value.as_array())
-                .and_then(|values| values.first())
-                .and_then(|value| value.as_str()),
-            Some("Eito")
-        );
-        assert_eq!(
-            fm.fields.get("authors").map(|field| field.typst.as_str()),
-            Some("(\"Eito\",)")
-        );
+        assert_eq!(fm.fields["authors"].export_json(), Some(json!(["Eito"])));
     }
 
     #[test]
@@ -7642,24 +7673,12 @@ Project body.
         assert_eq!(meta.toc, Some(false));
         assert_eq!(body, "Project body.\n");
         assert_eq!(
-            meta.fields
-                .get("languages")
-                .and_then(|field| field.value.as_ref())
-                .and_then(|value| value.as_array())
-                .and_then(|values| values.first())
-                .and_then(|value| value.as_str()),
-            Some("Typst")
+            meta.fields["languages"].export_json(),
+            Some(json!(["Typst"]))
         );
         assert_eq!(
-            meta.fields
-                .get("links")
-                .and_then(|field| field.value.as_ref())
-                .and_then(|value| value.as_array())
-                .and_then(|values| values.first())
-                .and_then(|value| value.as_table())
-                .and_then(|table| table.get("label"))
-                .and_then(|value| value.as_str()),
-            Some("GitHub")
+            meta.fields["links"].export_json().unwrap()[0]["label"],
+            "GitHub"
         );
     }
 
@@ -7722,10 +7741,7 @@ Body
         };
         page.fields.insert(
             "series".to_string(),
-            MetadataField {
-                typst: "\"guide\"".to_string(),
-                value: Some(toml::Value::String("guide".to_string())),
-            },
+            MetadataField::from_toml(toml::Value::String("guide".to_string())),
         );
         let data = site_data_typ(&cfg, &[page], &[], &BTreeMap::new());
         assert!(data.contains("#let sections"));

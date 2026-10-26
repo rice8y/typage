@@ -4,11 +4,12 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use anyhow::{bail, Context, Result};
+use comemo::Track;
 use typst::diag::{FileError, FileResult, SourceDiagnostic, SourceResult};
-use typst::foundations::{Bytes, Datetime, Dict, Duration, IntoValue};
+use typst::foundations::{Binding, Bytes, Datetime, Dict, Duration, IntoValue, Module};
 use typst::syntax::{FileId, RootedPath, Source, VirtualPath, VirtualRoot};
 use typst::text::{Font, FontBook};
 use typst::utils::LazyHash;
@@ -49,6 +50,8 @@ pub struct Compiler {
     ignore_system_fonts: bool,
     ignore_embedded_fonts: bool,
     timestamp: Option<i64>,
+    metadata: RwLock<Dict>,
+    metadata_dependencies: RwLock<Dependencies>,
 }
 
 impl Compiler {
@@ -91,6 +94,8 @@ impl Compiler {
             ignore_system_fonts: env_bool("TYPST_IGNORE_SYSTEM_FONTS")?,
             ignore_embedded_fonts: env_bool("TYPST_IGNORE_EMBEDDED_FONTS")?,
             timestamp,
+            metadata: RwLock::new(Dict::new()),
+            metadata_dependencies: RwLock::new(Dependencies::new()),
         })
     }
 
@@ -108,6 +113,57 @@ impl Compiler {
             }
             store
         })
+    }
+
+    pub fn set_metadata(&self, values: Dict, dependencies: Dependencies) {
+        *self.metadata.write().expect("metadata poisoned") = values;
+        *self
+            .metadata_dependencies
+            .write()
+            .expect("metadata dependencies poisoned") = dependencies;
+    }
+
+    pub fn evaluate(
+        &self,
+        path: &Path,
+        source: &str,
+        bindings: &Dict,
+    ) -> Result<(Module, Dependencies)> {
+        use typst::engine::{Route, Sink, Traced};
+        let mut world = CompileWorld::new(self, path, "html", &[])?;
+        let mut library = (*world.library).clone();
+        for (name, value) in bindings.iter() {
+            library
+                .global
+                .scope_mut()
+                .bind(name.clone().into(), Binding::detached(value.clone()));
+        }
+        world.library = LazyHash::new(library);
+        let source = Source::new(world.main, source.to_string());
+        world.overlay = Some(source.clone());
+        world
+            .dependencies
+            .lock()
+            .expect("dependencies poisoned")
+            .insert(
+                crate::util::normalize_path(path)?,
+                fs::read(path).ok().map(|bytes| fingerprint(&bytes)),
+            );
+        let mut sink = Sink::new();
+        let module = world.result(typst_eval::eval(
+            (&world as &dyn World).track(),
+            &world.library,
+            Traced::default().track(),
+            sink.track_mut(),
+            Route::default().track(),
+            &source,
+        ))?;
+        let dependencies = world
+            .dependencies
+            .lock()
+            .expect("dependencies poisoned")
+            .clone();
+        Ok((module, dependencies))
     }
 
     pub fn compile(
@@ -220,6 +276,7 @@ struct CompileWorld<'a> {
     files: FileStore<ProjectFiles<'a>>,
     time: Time,
     dependencies: Arc<Mutex<Dependencies>>,
+    overlay: Option<Source>,
 }
 
 impl<'a> CompileWorld<'a> {
@@ -229,26 +286,34 @@ impl<'a> CompileWorld<'a> {
         flags: &str,
         inputs: &[(&str, &str)],
     ) -> Result<Self> {
-        let input = input
-            .canonicalize()
-            .with_context(|| format!("failed to read {}", input.display()))?;
+        let input = crate::util::normalize_path(input)?;
         let path = VirtualPath::virtualize(&compiler.root, &input)?;
         let main = RootedPath::new(VirtualRoot::Project, path).intern();
         let inputs: Dict = inputs
             .iter()
             .map(|(key, value)| ((*key).into(), (*value).into_value()))
             .collect();
-        let library = Library::builder()
+        let mut library = Library::builder()
             .with_inputs(inputs)
             .with_features(features(flags)?)
             .build();
+        library.global.scope_mut().define(
+            "__typage_values",
+            compiler.metadata.read().expect("metadata poisoned").clone(),
+        );
         let time = match compiler.timestamp {
             Some(timestamp) => {
                 Time::fixed_timestamp(timestamp).map_err(|err| anyhow::anyhow!(err))?
             }
             None => Time::system(),
         };
-        let dependencies = Arc::new(Mutex::new(BTreeMap::new()));
+        let dependencies = Arc::new(Mutex::new(
+            compiler
+                .metadata_dependencies
+                .read()
+                .expect("metadata dependencies poisoned")
+                .clone(),
+        ));
         Ok(Self {
             compiler,
             main,
@@ -256,6 +321,7 @@ impl<'a> CompileWorld<'a> {
             files: FileStore::new(ProjectFiles(compiler, dependencies.clone())),
             time,
             dependencies,
+            overlay: None,
         })
     }
 
@@ -296,6 +362,11 @@ impl World for CompileWorld<'_> {
         self.main
     }
     fn source(&self, id: FileId) -> FileResult<Source> {
+        if id == self.main {
+            if let Some(source) = &self.overlay {
+                return Ok(source.clone());
+            }
+        }
         self.files.source(id)
     }
     fn file(&self, id: FileId) -> FileResult<Bytes> {

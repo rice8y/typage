@@ -1,7 +1,6 @@
 title = "Typage"
 base_url = ""
 lang = "en"
-typst = "typst"
 content_dir = "content"
 templates_dir = "templates"
 static_dir = "static"

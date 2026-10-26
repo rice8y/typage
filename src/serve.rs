@@ -146,7 +146,6 @@ fn start_live_rebuild_thread(
                         root: root.clone(),
                         drafts,
                         force: false,
-                        typst_override: None,
                         pdf,
                         keep_going: true,
                         jobs,

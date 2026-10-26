@@ -2,7 +2,9 @@
   if target() == "html" {
     if href == none {
       html.elem("section", attrs: (class: "card"))[
-        #if title != none { html.elem("h2", attrs: (class: "card-title"))[#title] }
+        #if title != none {
+          html.elem("h2", attrs: (class: "card-title"))[#title]
+        }
         #body
       ]
     } else {

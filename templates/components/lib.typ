@@ -1,5 +1,5 @@
 #import "@local/typage:0.1.5": taxonomy-url
-#import "callout.typ": note, callout
+#import "callout.typ": callout, note
 #import "card.typ": card
 #import "media.typ": fig, youtube
 

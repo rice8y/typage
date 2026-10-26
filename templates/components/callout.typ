@@ -2,7 +2,9 @@
   let classes = "callout callout-" + str(kind)
   if target() == "html" {
     html.elem("aside", attrs: (class: classes))[
-      #if title != none { html.elem("p", attrs: (class: "callout-title"))[#title] }
+      #if title != none {
+        html.elem("p", attrs: (class: "callout-title"))[#title]
+      }
       #body
     ]
   } else {

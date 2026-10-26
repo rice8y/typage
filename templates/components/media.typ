@@ -9,7 +9,9 @@
     ]
   } else {
     if src != none {
-      if caption != none { figure(image(src), caption: caption) } else { image(src) }
+      if caption != none { figure(image(src), caption: caption) } else {
+        image(src)
+      }
     } else if body != none {
       if caption != none { figure(body, caption: caption) } else { body }
     }
@@ -20,7 +22,12 @@
   let src = "https://www.youtube-nocookie.com/embed/" + id
   if target() == "html" {
     html.elem("div", attrs: (class: "embed embed-youtube"))[
-      #html.elem("iframe", attrs: (src: src, title: title, loading: "lazy", allowfullscreen: ""))[]
+      #html.elem("iframe", attrs: (
+        src: src,
+        title: title,
+        loading: "lazy",
+        allowfullscreen: "",
+      ))[]
     ]
   } else {
     link(src)[#title]

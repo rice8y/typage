@@ -10,15 +10,25 @@ Typage depends on Typst's HTML export, which is currently under active developme
 
 **Do not use Typage or Typst HTML export for production use cases.** Expect breaking changes, missing HTML features, and output changes as Typst's exporter evolves.
 
-In the Typst CLI, HTML export can be enabled with `--features html` or `TYPST_FEATURES=html`. HTML export is not available in the Typst web app at this time. Follow Typst's [HTML export tracking issue](https://github.com/typst/typst/issues/5512) for upstream progress and planned features.
+Typage enables experimental HTML export in its embedded compiler. Follow Typst's [HTML export tracking issue](https://github.com/typst/typst/issues/5512) for upstream progress and planned features.
 
 ## Requirements
 
 - Rust 1.92 or later and Cargo are required to install or build `typage`.
-- Typst CLI 0.15.0 or later is required.
+- Typst 0.15.1 is embedded through Rust crates. No separate Typst CLI installation is required.
 - HTML builds require Typst's experimental HTML export. Typage enables it through `features = "html"` by default.
-- `typage bundle` requires Typst's experimental Bundle Export, which is only available in Typst 0.15.0 or later. Typage enables it through `bundle_features = "bundle,html"` by default.
-- Typage currently shells out to the Typst CLI. The Typst web app cannot be used as the compiler backend.
+- `typage bundle` uses the embedded experimental Bundle Export with `bundle_features = "bundle,html"` by default.
+- Building from source requires a native linker and, on Linux, OpenSSL development headers and `pkg-config` for HTTPS package downloads.
+
+### Embedded Compiler
+
+HTML, per-page PDF, combined print PDF, and bundle exports all run in-process. `typage doctor` reports the embedded compiler version. The old `--typst` option has been removed; remove `typst = "..."` from existing configuration files. The compiler version is selected by Typage's dependencies rather than an executable on `PATH`.
+
+System fonts and Typst's standard embedded fonts are available. Additional fonts can be supplied through `TYPST_FONT_PATHS` (an OS-separated path list). Set `TYPST_IGNORE_SYSTEM_FONTS=true` or `TYPST_IGNORE_EMBEDDED_FONTS=true` to disable the corresponding source. Generated `@local/typage` and `@local/typage-theme` packages take precedence over system packages. Other packages are loaded from the standard Typst data/cache directories or downloaded from Typst Universe when missing. Downloads require network access on the first build.
+
+`TYPST_PACKAGE_PATH`, `TYPST_PACKAGE_CACHE_PATH`, and `TYPST_CERT` customize package locations and the HTTPS certificate. Relative paths are resolved from the project root. `SOURCE_DATE_EPOCH` fixes Typst's current date and PDF creation timestamp for reproducible builds. Experimental features are configured with `features` and `bundle_features` in `config.toml`.
+
+Each compile job has its own sources and inputs; fonts and package loading are shared within a build. File reads are restricted to the project or the imported package's root, including symlink checks. Compiler upgrades invalidate the build cache. After changing installed fonts or external package contents, use `typage build --force`.
 
 ## Philosophy
 
@@ -67,7 +77,7 @@ In the Typst CLI, HTML export can be enabled with `--features html` or `TYPST_FE
 - ETag and 304 responses for cacheable dev-server files.
 - Changed-only static asset copying.
 - Parallel Typst compile jobs through `jobs = 0` or `--jobs`.
-- Job-local page context through `--input typage_current=...`.
+- Job-local page context through Typst's `sys.inputs` dictionary.
 - `doctor`, `new`, `theme new`, `theme list --verbose`, `theme info`, and `theme check`.
 - `plugin install`, `plugin list`, `plugin doctor`, and `plugin run`.
 - Deployment scaffolds for GitHub Pages, Cloudflare Pages, Netlify, and Vercel.
@@ -75,7 +85,7 @@ In the Typst CLI, HTML export can be enabled with `--features html` or `TYPST_FE
 - Generated local Typst packages `@local/typage:0.1.5` and `@local/typage-theme:0.1.5`.
 - Section-local previous and next navigation.
 - HTML/PDF dual-target helpers using `context { ... target() ... }`.
-- Unit tests plus a Typst-backed integration test when `typst` is available.
+- Unit tests and embedded-compiler integration tests, including builds without a Typst executable on `PATH`.
 
 ## Quick Start
 
@@ -693,7 +703,7 @@ typage serve --live-reload --jobs 4
 typage build --jobs 1
 ```
 
-`current` is passed to Typst with `--input typage_current=<json>`, so each compile job has independent page context and does not race on shared state.
+`current` is passed through the job's `sys.inputs.typage_current` JSON value (or a generated metadata file for large values), so each compile job has independent page context. Fonts and package resolution are shared across jobs.
 
 ## Scripts
 
@@ -825,13 +835,13 @@ Because `public/` is disposable, files that must appear in deployed output are w
 
 If a scaffold already exists, Typage refuses to overwrite it. Use `--force` when you intentionally want to regenerate it.
 
-Generated deploy scaffolds install or document the need for both Typst CLI 0.15.0 and Typage before running `typage build`. GitHub Pages uses `typst-community/setup-typst`; Vercel and Netlify install `typst-cli` and `typage` with Cargo by default.
+Generated deploy scaffolds install Typage with `cargo install typage --locked` before running `typage build`. Typage includes the compiler, so a separate Typst installation is unnecessary. Regenerate existing scaffolds with `typage deploy init <target> --force` to remove the old Typst CLI installation steps.
 
 During local development, adjust `cargo install typage --locked` to `cargo install --path .` or `cargo install --git https://github.com/rice8y/typage` as needed.
 
 ## Notes
 
-`@local/typage:0.1.5` and `@local/typage-theme:0.1.5` are staged under `.typage/packages/local/` and passed to Typst with `--package-path`.
+`@local/typage:0.1.5` and `@local/typage-theme:0.1.5` are staged under `.typage/packages/local/` and resolved by the embedded compiler's package loader.
 
 Typst HTML Export and Bundle Export are experimental. Typage is designed with that moving target in mind.
 

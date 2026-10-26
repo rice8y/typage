@@ -1,6 +1,26 @@
 //! Shared discovery and validation. Rendering starts only after this plan succeeds.
-use super::*;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
+use anyhow::{bail, Context, Result};
+
+use crate::compiler;
+use crate::config::Config;
+use crate::model::{FrontMatter, GeneratedPage, Page, PageSummary, SkipStats};
+
+use super::outputs::{validate_output_paths, validate_routes};
+use super::pagination::make_generated_pages;
+use super::print::{
+    discover_print_candidate_pages, pdf_document_candidate_inclusion, pdf_document_inclusion,
+    preprocess_print_pages, select_pdf_document_page_indices, validate_pdf_document_configs,
+};
+use super::theme::{inspect_theme, static_roots, templates_root};
+use super::{
+    assign_prev_next, build_link_map, discover_pages, discover_sections, load_content_collections,
+    preprocess_body, template_hash, validate_directory_policy, ContentCollections,
+};
+
+/// Resolved input/output roots that have passed the directory overlap policy.
 pub(super) struct SitePaths {
     pub content_root: PathBuf,
     pub templates_root: PathBuf,
@@ -31,6 +51,11 @@ impl SitePaths {
     }
 }
 
+/// Shared discovery result for build, doctor, and bundle.
+///
+/// This validates source-level constraints, not target-specific compilation.
+/// HTML pages and print candidates are separate because PDF documents can
+/// override the site's publication filters.
 pub(super) struct BuildPlan {
     pub paths: SitePaths,
     pub collections: ContentCollections,
@@ -43,6 +68,10 @@ pub(super) struct BuildPlan {
 }
 
 impl BuildPlan {
+    /// Evaluates metadata and validates references without publishing outputs.
+    ///
+    /// Build callers run content-generating plugins first. Doctor checks the
+    /// sources already present and does not execute those plugins.
     pub fn discover(root: &Path, cfg: &Config, drafts: bool, pdf: bool) -> Result<Self> {
         let paths = SitePaths::new(root, cfg)?;
         compiler::features(&cfg.features)?;

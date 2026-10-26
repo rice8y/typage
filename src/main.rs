@@ -1,3 +1,11 @@
+use std::path::PathBuf;
+use std::process::Command as ProcessCommand;
+
+use anyhow::{bail, Result};
+use clap::{Parser, Subcommand};
+
+use crate::config::load_config;
+
 mod build;
 mod compiler;
 mod config;
@@ -10,14 +18,6 @@ mod starter;
 mod term;
 mod util;
 mod watch;
-
-use std::path::PathBuf;
-use std::process::Command as ProcessCommand;
-
-use anyhow::{bail, Result};
-use clap::{Parser, Subcommand};
-
-use crate::config::load_config;
 
 #[derive(Parser, Debug)]
 #[command(name = "typage")]

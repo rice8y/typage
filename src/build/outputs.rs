@@ -1,5 +1,16 @@
 //! Output ownership, path validation, redirects, and stale-file cleanup.
-use super::*;
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use anyhow::{bail, Context, Result};
+
+use crate::config::{Config, PdfDocumentConfig};
+use crate::model::{GeneratedPage, Page};
+use crate::util::write_if_changed;
+
+use super::{clean_path, escape_html, normalize_directory_url, validate_url_segment};
 
 pub(super) fn validate_routes(pages: &[Page], generated: &[GeneratedPage]) -> Result<()> {
     let mut seen = BTreeMap::<String, String>::new();
@@ -28,39 +39,6 @@ pub(super) fn validate_routes(pages: &[Page], generated: &[GeneratedPage]) -> Re
         insert_route(&mut seen, &gen.url, format!("generated {}", gen.title))?;
     }
     Ok(())
-}
-
-pub(super) fn validate_pdf_document_configs(
-    cfg: &Config,
-    templates_root: &Path,
-    out_root: &Path,
-    pages: &[Page],
-    section_meta: &BTreeMap<String, FrontMatter>,
-    drafts: bool,
-) -> Vec<String> {
-    let mut errors = Vec::<String>::new();
-    for (idx, doc) in cfg.pdf_documents.iter().enumerate() {
-        let label = format!("pdf_documents[{idx}] ({})", pdf_document_label(doc));
-        if let Err(err) = pdf_document_output_path(out_root, doc) {
-            errors.push(format!("{label}: {err}"));
-        }
-        if doc.template.trim().is_empty() {
-            errors.push(format!("{label}: template must not be empty"));
-        } else if let Err(err) = template_hash(templates_root, &doc.template) {
-            errors.push(format!("{label}: template error: {err:?}"));
-        }
-        if doc.sections.iter().any(|section| section.trim().is_empty()) {
-            errors.push(format!("{label}: section references must not be empty"));
-        }
-        if doc.pages.iter().any(|page| page.trim().is_empty()) {
-            errors.push(format!("{label}: page references must not be empty"));
-        }
-        let inclusion = pdf_document_inclusion(doc, cfg, drafts);
-        if let Err(err) = select_pdf_document_page_indices(doc, pages, section_meta, inclusion) {
-            errors.push(format!("{label}: {err}"));
-        }
-    }
-    errors
 }
 
 pub(super) fn collect_reserved_output_paths(
@@ -110,6 +88,10 @@ pub(super) fn collect_reserved_output_paths(
     Ok(outputs)
 }
 
+/// Maps public-relative asset paths to their winning source files.
+///
+/// Later roots override earlier roots, so project assets can replace theme
+/// assets. Symlinks are excluded to match the copy policy during publication.
 pub(super) fn static_assets(static_roots: &[PathBuf]) -> Result<BTreeMap<PathBuf, PathBuf>> {
     let mut assets = BTreeMap::new();
     for static_root in static_roots {
@@ -127,6 +109,8 @@ pub(super) fn static_assets(static_roots: &[PathBuf]) -> Result<BTreeMap<PathBuf
     Ok(assets)
 }
 
+/// Reserves all enabled outputs before compilation, including ancillary files.
+/// URL uniqueness alone cannot detect a static file occupying a page directory.
 pub(super) fn validate_output_paths(
     cfg: &Config,
     static_roots: &[PathBuf],
@@ -183,11 +167,15 @@ pub(super) fn validate_output_paths(
     Ok(())
 }
 
+/// Rejects duplicate files and file/directory conflicts in either insertion order.
+/// Paths must already be normalized into the same output-root namespace.
 pub(super) fn insert_output_path(
     outputs: &mut BTreeMap<PathBuf, String>,
     path: PathBuf,
     label: String,
 ) -> Result<()> {
+    // Ancestors detect an existing file above this path; the first ordered
+    // successor detects an existing descendant below it.
     let conflict = path
         .ancestors()
         .find_map(|ancestor| outputs.get_key_value(ancestor))
@@ -343,6 +331,8 @@ pub(super) fn write_alias_pages(out_root: &Path, pages: &[Page]) -> Result<()> {
     Ok(())
 }
 
+/// Computes the complete keep-set, including outputs skipped through cache hits.
+/// Cleanup cannot use only this build's staged files, which omit cached outputs.
 pub(super) fn desired_public_outputs(
     cfg: &Config,
     static_roots: &[PathBuf],
@@ -393,6 +383,8 @@ pub(super) fn desired_public_outputs(
     Ok(desired)
 }
 
+/// Removes stale files from the managed output directory after publication.
+/// Callers must supply the full keep-set and finish staging successfully first.
 pub(super) fn cleanup_public_outputs(out_root: &Path, desired: &BTreeSet<PathBuf>) -> Result<()> {
     if !out_root.exists() {
         return Ok(());

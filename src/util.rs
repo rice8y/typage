@@ -90,7 +90,7 @@ fn files_equal(a: &Path, b: &Path) -> Result<bool> {
         if a_len == 0 {
             return Ok(true);
         }
-        if &a_buf[..a_len] != &b_buf[..b_len] {
+        if a_buf[..a_len] != b_buf[..b_len] {
             return Ok(false);
         }
     }

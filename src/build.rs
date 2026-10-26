@@ -140,9 +140,10 @@ struct CompileReport {
 }
 
 pub fn init_project(root: &Path) -> Result<()> {
-    fs::create_dir_all(root.join("content"))?;
-    fs::create_dir_all(root.join("templates/components"))?;
-    fs::create_dir_all(root.join("static"))?;
+    let root = normalize_path(root)?;
+    crate::util::create_dir_all_checked(root.join("content"))?;
+    crate::util::create_dir_all_checked(root.join("templates/components"))?;
+    crate::util::create_dir_all_checked(root.join("static"))?;
     write_if_missing(root.join("config.toml"), include_str!("../config.toml"))?;
     write_if_missing(
         root.join("templates/base.typ"),
@@ -212,8 +213,8 @@ pub fn new_theme(root: PathBuf, name: String) -> Result<()> {
     let root = normalize_path(&root)?;
     validate_theme_name(&name)?;
     let theme_root = root.join("themes").join(&name);
-    fs::create_dir_all(theme_root.join("templates/components"))?;
-    fs::create_dir_all(theme_root.join("static"))?;
+    crate::util::create_dir_all_checked(theme_root.join("templates/components"))?;
+    crate::util::create_dir_all_checked(theme_root.join("static"))?;
     write_if_missing(theme_root.join("theme.toml"), &default_theme_toml(&name))?;
     write_if_missing(
         theme_root.join("templates/base.typ"),
@@ -1103,9 +1104,9 @@ fn build_site_in_session(opts: &BuildOptions, session: &mut BuildSession) -> Res
     let data_path = cache_root.join("site.typ");
     let cache_path = cache_root.join("build-cache.json");
 
-    fs::create_dir_all(&out_root)?;
-    fs::create_dir_all(&wrappers_root)?;
-    fs::create_dir_all(&generated_root)?;
+    crate::util::create_dir_all_checked(&out_root)?;
+    crate::util::create_dir_all_checked(&wrappers_root)?;
+    crate::util::create_dir_all_checked(&generated_root)?;
 
     crate::plugin::run_build_plugins(&root, &cfg, opts.quiet)?;
 
@@ -1252,7 +1253,7 @@ fn build_site_in_session(opts: &BuildOptions, session: &mut BuildSession) -> Res
         });
     }
 
-    let print_jobs = prepare_print_document_jobs(
+    let mut print_jobs = prepare_print_document_jobs(
         &root,
         &cfg,
         &content_root,
@@ -1275,6 +1276,18 @@ fn build_site_in_session(opts: &BuildOptions, session: &mut BuildSession) -> Res
         .iter()
         .map(|doc| pdf_document_output_path(&out_root, doc))
         .collect::<Result<Vec<_>>>()?;
+    let staged = tempfile::Builder::new()
+        .prefix("publish-")
+        .tempdir_in(&cache_root)?;
+    let stage_path =
+        |path: &Path| -> Result<PathBuf> { Ok(staged.path().join(path.strip_prefix(&out_root)?)) };
+    for job in &mut compile_jobs {
+        job.html_output = stage_path(&job.html_output)?;
+        job.pdf_output = job.pdf_output.as_deref().map(stage_path).transpose()?;
+    }
+    for job in &mut print_jobs {
+        job.output_pdf = stage_path(&job.output_pdf)?;
+    }
     let total_compile_jobs = compile_jobs.len() + print_jobs.len();
     let compile_concurrency = effective_jobs(opts.jobs, cfg.jobs, total_compile_jobs);
     if !opts.quiet {
@@ -1389,24 +1402,31 @@ fn build_site_in_session(opts: &BuildOptions, session: &mut BuildSession) -> Res
     }
     progress.finish();
 
-    for static_root in &static_roots {
-        copy_dir(static_root, &out_root)?;
+    if !failures.is_empty() {
+        bail!(
+            "build failed; public outputs were not updated\n\n{}",
+            failures.join("\n\n")
+        );
     }
-    write_alias_pages(&out_root, &pages)?;
+
+    for static_root in &static_roots {
+        copy_dir(static_root, staged.path())?;
+    }
+    write_alias_pages(staged.path(), &pages)?;
     if cfg.sitemap {
-        write_sitemap(&cfg, &out_root, &summaries, &generated)?;
+        write_sitemap(&cfg, staged.path(), &summaries, &generated)?;
     }
     if cfg.feed {
-        write_configured_feeds(&cfg, &out_root, &summaries)?;
+        write_configured_feeds(&cfg, staged.path(), &summaries)?;
         if cfg.atom_feed {
-            write_atom_feed(&cfg, &out_root, &summaries)?;
+            write_atom_feed(&cfg, staged.path(), &summaries)?;
         }
     }
     if cfg.robots {
-        write_robots(&cfg, &out_root)?;
+        write_robots(&cfg, staged.path())?;
     }
     if cfg.search.enabled {
-        write_search_index(&out_root, &pages, &cfg.search)?;
+        write_search_index(staged.path(), &pages, &cfg.search)?;
     }
     let desired_outputs = desired_public_outputs(
         &cfg,
@@ -1417,6 +1437,7 @@ fn build_site_in_session(opts: &BuildOptions, session: &mut BuildSession) -> Res
         &print_outputs,
         opts.pdf,
     )?;
+    copy_dir(staged.path(), &out_root)?;
     cleanup_public_outputs(&out_root, &desired_outputs)?;
     write_cache(&cache_path, &cache)?;
 
@@ -1425,13 +1446,6 @@ fn build_site_in_session(opts: &BuildOptions, session: &mut BuildSession) -> Res
         if opts.profile {
             print_profile(&reports, compile_wall);
         }
-    }
-    if !failures.is_empty() {
-        bail!(
-            "build completed with {} failure(s)\n\n{}",
-            failures.len(),
-            failures.join("\n\n")
-        );
     }
     Ok(stats)
 }
@@ -1442,8 +1456,8 @@ pub fn bundle_site(root: PathBuf, drafts: bool) -> Result<()> {
     let content_root = root.join(&cfg.content_dir);
     let out_root = root.join(&cfg.out_dir);
     let cache_root = root.join(&cfg.cache_dir);
-    fs::create_dir_all(&out_root)?;
-    fs::create_dir_all(&cache_root)?;
+    crate::util::create_dir_all_checked(&out_root)?;
+    crate::util::create_dir_all_checked(&cache_root)?;
 
     let collections = load_content_collections(&content_root)?;
     let section_meta = discover_sections(&content_root)?;
@@ -2168,6 +2182,14 @@ fn validate_output_paths(
     }
     if cfg.search.enabled {
         reserve(out_root.join("search_index.json"), "search index".into())?;
+    }
+    for path in outputs.keys() {
+        crate::util::check_output_ancestors(path)?;
+        if let Ok(meta) = fs::symlink_metadata(path) {
+            if !meta.is_file() && !meta.file_type().is_symlink() {
+                bail!("refusing to overwrite non-file output {}", path.display());
+            }
+        }
     }
     Ok(())
 }
@@ -6873,7 +6895,10 @@ mod tests {
 
     #[test]
     fn rewrites_local_dependency_paths_for_isolated_wrappers() {
-        let tmp = std::env::temp_dir().join(format!("typage-test-{}", std::process::id()));
+        let tmp = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("typage-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let content = tmp.join("content");
         let wrappers = tmp.join(".typage/wrappers");
@@ -6943,8 +6968,10 @@ mod tests {
 
     #[test]
     fn detects_pdf_document_static_output_collision() {
-        let tmp =
-            std::env::temp_dir().join(format!("typage-pdf-collision-test-{}", std::process::id()));
+        let tmp = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("typage-pdf-collision-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let static_root = tmp.join("static");
         let out_root = tmp.join("public");
@@ -7036,8 +7063,10 @@ mod tests {
     #[test]
     fn section_index_page_suppresses_generated_section_page() {
         let cfg = Config::default();
-        let out =
-            std::env::temp_dir().join(format!("typage-section-index-test-{}", std::process::id()));
+        let out = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("typage-section-index-test-{}", std::process::id()));
         let pages = vec![
             PageSummary {
                 kind: "page".to_string(),
@@ -7124,8 +7153,10 @@ mod tests {
 
     #[test]
     fn current_input_args_spills_large_current_into_typage_package() {
-        let tmp =
-            std::env::temp_dir().join(format!("typage-current-input-test-{}", std::process::id()));
+        let tmp = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("typage-current-input-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let cfg = Config::default();
         let large_current = format!(
@@ -7190,8 +7221,10 @@ mod tests {
     fn cache_decision_rebuilds_unsafe_output_symlink() {
         use std::os::unix::fs::symlink;
 
-        let tmp =
-            std::env::temp_dir().join(format!("typage-cache-link-test-{}", std::process::id()));
+        let tmp = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("typage-cache-link-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
         let outside = tmp.join("outside.html");
@@ -7222,7 +7255,7 @@ mod tests {
     fn prepare_output_file_removes_dangling_output_symlink() {
         use std::os::unix::fs::symlink;
 
-        let tmp = std::env::temp_dir().join(format!(
+        let tmp = std::env::temp_dir().canonicalize().unwrap().join(format!(
             "typage-prepare-dangling-link-test-{}",
             std::process::id()
         ));
@@ -7250,7 +7283,10 @@ mod tests {
 
     #[test]
     fn writes_virtual_typage_package() {
-        let tmp = std::env::temp_dir().join(format!("typage-pkg-test-{}", std::process::id()));
+        let tmp = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("typage-pkg-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let cfg = Config::default();
         write_typage_package_data(&tmp, &cfg, &site_data_typ(&cfg, &[], &[], &BTreeMap::new()))
@@ -7278,8 +7314,10 @@ mod tests {
 
     #[test]
     fn writes_virtual_theme_package() {
-        let tmp =
-            std::env::temp_dir().join(format!("typage-theme-pkg-test-{}", std::process::id()));
+        let tmp = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("typage-theme-pkg-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let cfg = Config::default();
         std::fs::create_dir_all(tmp.join("templates/components")).unwrap();
@@ -7306,8 +7344,10 @@ mod tests {
 
     #[test]
     fn theme_metadata_validates_declared_components() {
-        let tmp =
-            std::env::temp_dir().join(format!("typage-theme-check-test-{}", std::process::id()));
+        let tmp = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("typage-theme-check-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let theme = tmp.join("themes/default");
         std::fs::create_dir_all(theme.join("templates/components")).unwrap();
@@ -7325,8 +7365,10 @@ mod tests {
 
     #[test]
     fn theme_check_reports_missing_declared_component() {
-        let tmp =
-            std::env::temp_dir().join(format!("typage-theme-missing-test-{}", std::process::id()));
+        let tmp = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("typage-theme-missing-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let theme = tmp.join("themes/bad");
         std::fs::create_dir_all(theme.join("templates/components")).unwrap();
@@ -7404,7 +7446,10 @@ Use `read("inline.dat", encoding: none)` in examples.
 
     #[test]
     fn feeds_are_written_without_base_url() {
-        let tmp = std::env::temp_dir().join(format!("typage-feed-test-{}", std::process::id()));
+        let tmp = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("typage-feed-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
         let mut cfg = Config::default();
@@ -7425,7 +7470,7 @@ Use `read("inline.dat", encoding: none)` in examples.
 
     #[test]
     fn configured_rss_feeds_filter_sections_and_paths() {
-        let tmp = std::env::temp_dir().join(format!(
+        let tmp = std::env::temp_dir().canonicalize().unwrap().join(format!(
             "typage-configured-feed-test-{}",
             std::process::id()
         ));

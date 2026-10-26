@@ -43,5 +43,4 @@ typst-syntax = "=0.15.1"
 comemo = "0.5.1"
 walkdir = "2.5"
 
-[dev-dependencies]
 tempfile = "3"

@@ -379,36 +379,15 @@ fn bundle_output_path(root: &Path, relative: &Path) -> Result<PathBuf> {
         bail!("unsafe bundle output path: {}", relative.display());
     }
     let path = root.join(relative);
-    check_output_ancestors(&path)?;
+    crate::util::check_output_ancestors(&path)?;
     Ok(path)
 }
 
-fn check_output_ancestors(path: &Path) -> Result<()> {
-    for ancestor in path.parent().into_iter().flat_map(Path::ancestors) {
-        match fs::symlink_metadata(ancestor) {
-            Ok(meta) if meta.file_type().is_symlink() => bail!(
-                "refusing to write through output directory symlink {}",
-                ancestor.display()
-            ),
-            Ok(meta) if !meta.is_dir() => {
-                bail!("output parent is not a directory: {}", ancestor.display())
-            }
-            Ok(_) => (),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => (),
-            Err(err) => return Err(err.into()),
-        }
-    }
-    Ok(())
+fn write_output(path: &Path, bytes: &[u8]) -> Result<()> {
+    crate::util::write_bytes_if_changed(path, bytes)
 }
 
-fn write_output(path: &Path, bytes: &[u8]) -> Result<()> {
-    check_output_ancestors(path)?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    prepare_output_file(path)?;
-    fs::write(path, bytes).with_context(|| format!("failed to write {}", path.display()))
-}
+#[cfg(test)]
 
 pub(crate) fn prepare_output_file(path: &Path) -> Result<()> {
     match fs::symlink_metadata(path) {

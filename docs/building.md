@@ -45,6 +45,8 @@ out_dir = "dist"
 
 All public output paths are validated before compilation. Content, aliases, generated lists, enabled PDFs, feeds, search, sitemap, robots, and static assets must not collide, including file/directory conflicts. Project static files may override theme static files at the same path.
 
+Compiled outputs and generated assets are staged before publication. A compilation or asset-generation failure leaves published files and the build cache unchanged, including with `--keep-going`. Publication uses atomic replacement of individual files and then stale-file cleanup; it is not an atomic directory swap. An I/O failure during publication can still leave a mixture of old and new files. Parent-directory symlinks are rejected for writes; these checks are not a sandbox against another process concurrently replacing directories.
+
 ## Build Output and Profiling
 
 Default output is compact and colored. Use `NO_COLOR=1` to disable ANSI colors.

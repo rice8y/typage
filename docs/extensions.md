@@ -104,3 +104,5 @@ Plugin doctor checks run:
 ```
 
 The manifest must print valid JSON. Typage does not install plugins automatically during build, serve, or deploy; install the plugin binary explicitly in local development and CI.
+
+Starter application preflights all file conflicts and plugin registrations before copying files. Writes use atomic file replacement and reject parent-directory symlinks. Temporary Git checkouts are cleaned up on success or failure. This is not a transaction for external `cargo install` operations or an operating-system I/O failure; review and trust starters and plugins before executing them.

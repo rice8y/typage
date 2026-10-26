@@ -14,6 +14,12 @@ System fonts and Typst's standard embedded fonts are available. Additional fonts
 
 Each compile job has its own sources and inputs; fonts and package loading are shared within a build. File reads are restricted to the project or the imported package's root, including symlink checks. The cache records actual Typst source and file reads, including dynamic paths and imported packages, and hashes binary contents without text conversion. Changed or deleted dependencies invalidate cached outputs; `--explain` identifies them. Compiler upgrades also invalidate the cache. After changing installed fonts, use `typage build --force`.
 
+## Build Stages
+
+`build`, `doctor`, and `bundle` use a shared build plan for discovery, metadata evaluation, link processing, template checks, PDF references, and output ownership. Validation finishes before wrappers or public outputs are written. Build and bundle run configured generation plugins before discovery; doctor checks the existing content without running generation plugins.
+
+Compilation and publication remain target-specific. Normal builds cache individual HTML/PDF jobs; bundle export uses Typst's bundle target. Both stage compiler results before publishing. Metadata dependencies belong to the shared site graph, while page bodies belong to their own compile jobs, so a body-only edit does not invalidate unrelated pages unless it changes shared headings or other site data.
+
 ## Watch and Live Reload
 
 `typage watch` and `typage serve --live-reload` share a build session. Saves are debounced after the last change, and changes arriving during compilation remain queued. The session watches configuration files, plugin configuration, source directories (including newly created directories), and recorded compiler dependencies. Configuration changes take effect on the next build, including a changed output directory in live preview.

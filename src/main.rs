@@ -2,6 +2,7 @@ mod build;
 mod compiler;
 mod config;
 mod deploy;
+mod metadata;
 mod model;
 mod plugin;
 mod serve;

@@ -99,6 +99,7 @@ Generate hosting configuration with `typage deploy init <target>`, where `<targe
 | [Starters and Plugins](docs/extensions.md) | Starter manifests, plugin installation and protocol |
 | [Building and PDF Export](docs/building.md) | Compiler settings, PDFs, parallel builds, scripts, hooks |
 | [Deployment](docs/deployment.md) | Hosting scaffolds and CI setup |
+| [Development](docs/development.md) | Code style, module responsibilities, verification |
 
 Run `typage --help` or `typage <command> --help` for command options. See [config.toml](config.toml) for configuration examples.
 

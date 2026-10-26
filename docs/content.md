@@ -108,6 +108,23 @@ The generated site package exposes section data:
 
 Generated `@local/typage` and `@local/typage-theme` imports before the directive are retained for rendering but skipped during metadata evaluation: the site graph does not exist yet. Metadata must not depend on these generated packages. Put shared metadata constants and schema definitions in ordinary Typst modules instead.
 
+## Source Paths
+
+Page bodies are evaluated at their original source paths, including in per-page
+PDF, combined print PDF, and bundle exports. Relative `import`, `include`,
+`image`, `read`, `json`, and other Typst file operations resolve from the file
+that contains them. Computed filenames work without path rewriting:
+
+```typst
+#let filename = "data" + ".json"
+#json(filename).title
+```
+
+Absolute Typst paths such as `/content/shared.typ` remain relative to the project
+root. Files actually read during compilation participate in cache invalidation
+and watch rebuilds. Source files are not modified; reading a source as raw data
+returns its original bytes, including its metadata directive.
+
 ## Permalinks
 
 By default, Typage uses directory URLs:

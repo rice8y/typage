@@ -1,7 +1,7 @@
 //! Embedded Typst compilation, with per-job sources and shared fonts/packages.
 
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
@@ -166,6 +166,7 @@ impl Compiler {
         Ok((module, dependencies))
     }
 
+    #[cfg(test)]
     pub fn compile(
         &self,
         input: &Path,
@@ -174,7 +175,32 @@ impl Compiler {
         features: &str,
         inputs: &[(&str, &str)],
     ) -> Result<Dependencies> {
-        let world = CompileWorld::new(self, input, features, inputs)?;
+        self.compile_with_context(
+            CompileRequest {
+                input,
+                output,
+                format,
+                features,
+                inputs,
+            },
+            &EvaluationContext::default(),
+        )
+    }
+
+    pub fn compile_with_context(
+        &self,
+        request: CompileRequest<'_>,
+        context: &EvaluationContext,
+    ) -> Result<Dependencies> {
+        let CompileRequest {
+            input,
+            output,
+            format,
+            features,
+            inputs,
+        } = request;
+        let mut world = CompileWorld::new(self, input, features, inputs)?;
+        world.set_context(context)?;
         match format {
             "html" => {
                 let doc = world.compile::<typst_html::HtmlDocument>()?;
@@ -269,6 +295,21 @@ pub fn features(value: &str) -> Result<Features> {
         .collect()
 }
 
+/// Processed sources retain their original identities for Typst path resolution.
+/// Each compilation owns its overlays; raw file reads still see disk bytes.
+#[derive(Clone, Debug, Default)]
+pub struct EvaluationContext {
+    pub sources: BTreeMap<PathBuf, String>,
+}
+
+pub struct CompileRequest<'a> {
+    pub input: &'a Path,
+    pub output: &'a Path,
+    pub format: &'a str,
+    pub features: &'a str,
+    pub inputs: &'a [(&'a str, &'a str)],
+}
+
 struct CompileWorld<'a> {
     compiler: &'a Compiler,
     main: FileId,
@@ -277,6 +318,7 @@ struct CompileWorld<'a> {
     time: Time,
     dependencies: Arc<Mutex<Dependencies>>,
     overlay: Option<Source>,
+    sources: HashMap<FileId, Source>,
 }
 
 impl<'a> CompileWorld<'a> {
@@ -322,7 +364,18 @@ impl<'a> CompileWorld<'a> {
             time,
             dependencies,
             overlay: None,
+            sources: HashMap::new(),
         })
+    }
+
+    fn set_context(&mut self, context: &EvaluationContext) -> Result<()> {
+        for (path, text) in &context.sources {
+            let path = self.compiler.root.join(path);
+            let virtual_path = VirtualPath::virtualize(&self.compiler.root, &path)?;
+            let id = RootedPath::new(VirtualRoot::Project, virtual_path).intern();
+            self.sources.insert(id, Source::new(id, text.clone()));
+        }
+        Ok(())
     }
 
     fn compile<T: typst::foundations::Output>(&self) -> Result<T> {
@@ -362,6 +415,12 @@ impl World for CompileWorld<'_> {
         self.main
     }
     fn source(&self, id: FileId) -> FileResult<Source> {
+        if let Some(source) = self.sources.get(&id) {
+            // Run the normal confined loader even for overlays: validate symlinks
+            // and fingerprint the original file for cache/watch invalidation.
+            self.files.file(id)?;
+            return Ok(source.clone());
+        }
         if id == self.main {
             if let Some(source) = &self.overlay {
                 return Ok(source.clone());
@@ -639,6 +698,46 @@ mod tests {
         for path in ["../outside", "/absolute", "", "a/../../outside"] {
             assert!(bundle_output_path(&compiler.root, Path::new(path)).is_err());
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_overlays_preserve_confinement_and_disk_dependencies() {
+        let (_temp, compiler) = project();
+        let input = compiler.root.join("main.typ");
+        fs::write(&input, "Original bytes").unwrap();
+        let context = EvaluationContext {
+            sources: BTreeMap::from([(input.clone(), "Processed content".into())]),
+        };
+        let mut world = CompileWorld::new(&compiler, &input, "html", &[]).unwrap();
+        world.set_context(&context).unwrap();
+        assert_eq!(
+            world.source(world.main).unwrap().text(),
+            "Processed content"
+        );
+        assert_eq!(
+            world.file(world.main).unwrap().as_slice(),
+            b"Original bytes"
+        );
+        assert_eq!(
+            world.dependencies.lock().unwrap().get(&input),
+            Some(&Some(fingerprint(b"Original bytes")))
+        );
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("secret.typ");
+        fs::write(&secret, "Secret").unwrap();
+        let mut world = CompileWorld::new(&compiler, &input, "html", &[]).unwrap();
+        world.set_context(&context).unwrap();
+        fs::remove_file(&input).unwrap();
+        std::os::unix::fs::symlink(secret, &input).unwrap();
+        assert!(matches!(
+            world.source(world.main),
+            Err(FileError::AccessDenied)
+        ));
+        let outside_context = EvaluationContext {
+            sources: BTreeMap::from([(outside.path().join("other.typ"), "Outside".into())]),
+        };
+        assert!(world.set_context(&outside_context).is_err());
     }
 
     #[cfg(unix)]

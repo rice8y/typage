@@ -53,24 +53,6 @@ fn reports_broken_links() {
 }
 
 #[test]
-fn rewrites_local_dependency_paths_for_isolated_wrappers() {
-    let tmp = std::env::temp_dir()
-        .canonicalize()
-        .unwrap()
-        .join(format!("typage-test-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&tmp);
-    let content = tmp.join("content");
-    let wrappers = tmp.join(".typage/wrappers");
-    std::fs::create_dir_all(&content).unwrap();
-    std::fs::create_dir_all(&wrappers).unwrap();
-    std::fs::write(content.join("dep.typ"), "#let x = 1").unwrap();
-    let got =
-        rewrite_local_dependency_paths("#import \"dep.typ\": x", &content, &wrappers).unwrap();
-    assert!(got.contains("../../content/dep.typ") || got.contains("../content/dep.typ"));
-    let _ = std::fs::remove_dir_all(&tmp);
-}
-
-#[test]
 fn rejects_unsafe_aliases() {
     assert!(alias_to_url("old/hello").is_ok());
     assert!(alias_to_url("../escape").is_err());

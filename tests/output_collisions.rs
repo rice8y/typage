@@ -19,10 +19,12 @@ fn rejects_collisions_before_publishing_even_without_print_documents() {
             .status
             .success());
         let config = root.join("config.toml");
-        let mut cfg: toml::Value = fs::read_to_string(&config).unwrap().parse().unwrap();
+        let mut cfg: toml::Value = toml::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
         cfg["feed"] = true.into();
         cfg["robots"] = true.into();
-        cfg["feed_path"] = "feed.xml".into();
+        cfg.as_table_mut()
+            .unwrap()
+            .insert("feed_path".into(), "feed.xml".into());
         cfg["search"]["enabled"] = true.into();
         fs::write(config, toml::to_string(&cfg).unwrap()).unwrap();
         fs::write(root.join("static").join(relative), "collision").unwrap();

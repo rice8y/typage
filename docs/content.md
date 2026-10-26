@@ -106,6 +106,8 @@ The generated site package exposes section data:
 #siblings(current)
 ```
 
+Generated `@local/typage` and `@local/typage-theme` imports before the directive are retained for rendering but skipped during metadata evaluation: the site graph does not exist yet. Metadata must not depend on these generated packages. Put shared metadata constants and schema definitions in ordinary Typst modules instead.
+
 ## Permalinks
 
 By default, Typage uses directory URLs:

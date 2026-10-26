@@ -2,6 +2,7 @@ use std::{fs, path::Path, process::Command};
 
 fn run(root: &Path, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_typage"))
+        .env("NO_COLOR", "1")
         .args(args)
         .arg("--root")
         .arg(root)

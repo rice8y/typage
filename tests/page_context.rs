@@ -2,6 +2,7 @@ use std::{fs, path::Path, process::Command};
 
 fn success(root: &Path, args: &[&str]) -> String {
     let result = Command::new(env!("CARGO_BIN_EXE_typage"))
+        .env("NO_COLOR", "1")
         .args(args)
         .arg("--root")
         .arg(root)

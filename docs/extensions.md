@@ -26,7 +26,7 @@ Starter repositories can place project files under `files/` and describe plugin 
 ```toml
 name = "typst-docs"
 description = "Typst package API documentation starter."
-min_typage = "0.1.5"
+min_typage = "0.2.0"
 
 [plugins.typst_docs]
 package = "typage-plugin-typst-docs"

@@ -136,6 +136,7 @@ struct CompileReport {
     duration: Duration,
     output_count: usize,
     generated: bool,
+    dependencies: crate::compiler::Dependencies,
 }
 
 pub fn init_project(root: &Path) -> Result<()> {
@@ -1143,13 +1144,6 @@ pub fn build_site(opts: &BuildOptions) -> Result<BuildStats> {
                     &decision.reasons,
                 );
             }
-            cache.entries.insert(
-                cache_key.clone(),
-                CacheEntry {
-                    hash: page.hash.clone(),
-                    outputs: outputs_to_strings(&outputs),
-                },
-            );
             stats.skipped += 1;
             continue;
         } else if opts.explain && !opts.quiet {
@@ -1192,13 +1186,6 @@ pub fn build_site(opts: &BuildOptions) -> Result<BuildStats> {
             if opts.explain && !opts.quiet {
                 print_explain("skip", &gen.url, &decision.reasons);
             }
-            cache.entries.insert(
-                cache_key.clone(),
-                CacheEntry {
-                    hash: hash.clone(),
-                    outputs: outputs_to_strings(&outputs),
-                },
-            );
             stats.skipped += 1;
             continue;
         } else if opts.explain && !opts.quiet {
@@ -1296,6 +1283,7 @@ pub fn build_site(opts: &BuildOptions) -> Result<BuildStats> {
                     CacheEntry {
                         hash: job.hash.clone(),
                         outputs: outputs_to_strings(&job.outputs),
+                        dependencies: Some(report.dependencies.clone()),
                     },
                 );
                 if job.generated {
@@ -1337,6 +1325,7 @@ pub fn build_site(opts: &BuildOptions) -> Result<BuildStats> {
                     CacheEntry {
                         hash: job.hash.clone(),
                         outputs: outputs_to_strings(&job.outputs),
+                        dependencies: Some(report.dependencies.clone()),
                     },
                 );
                 stats.generated += 1;
@@ -1882,7 +1871,11 @@ fn collect_dependencies(
         let bytes = fs::read(&canonical)
             .with_context(|| format!("failed to read dependency {}", canonical.display()))?;
         let text = String::from_utf8_lossy(&bytes).to_string();
-        parts.push(format!("{}:{}", canonical.display(), text));
+        parts.push(format!(
+            "{}:{}",
+            canonical.display(),
+            crate::compiler::fingerprint(&bytes)
+        ));
         if canonical.extension() == Some(OsStr::new("typ")) {
             let next_base = canonical.parent().unwrap_or(base_dir);
             collect_dependencies(next_base, &text, visited, parts)?;
@@ -4983,6 +4976,17 @@ fn cache_decision(
     if entry.hash != hash {
         reasons.push("hash changed".to_string());
     }
+    if entry.outputs != outputs_to_strings(outputs) {
+        reasons.push("output set changed".to_string());
+    }
+    match &entry.dependencies {
+        Some(dependencies) => {
+            for path in crate::compiler::changed_dependencies(dependencies) {
+                reasons.push(format!("dependency changed: {}", path.display()));
+            }
+        }
+        None => reasons.push("dependency manifest missing".to_string()),
+    }
     for output in outputs {
         match fs::symlink_metadata(output) {
             Ok(meta) if meta.file_type().is_file() => {}
@@ -5284,7 +5288,7 @@ fn run_compile_job(
     let started = Instant::now();
     let inputs = current_input_args(root, cfg, &job.cache_key, &job.current_json)?;
     let input_refs = input_arg_refs(&inputs);
-    compile_typst(
+    let mut dependencies = compile_typst(
         compiler,
         &job.input,
         &job.html_output,
@@ -5294,7 +5298,7 @@ fn run_compile_job(
         &input_refs,
     )?;
     if let Some(pdf_output) = &job.pdf_output {
-        compile_typst(
+        dependencies.extend(compile_typst(
             compiler,
             &job.input,
             pdf_output,
@@ -5302,13 +5306,14 @@ fn run_compile_job(
             "",
             format!("{} [pdf]", job.label),
             &input_refs,
-        )?;
+        )?);
     }
     Ok(CompileReport {
         label: job.label.clone(),
         duration: started.elapsed(),
         output_count: job.outputs.len(),
         generated: job.generated,
+        dependencies,
     })
 }
 
@@ -5321,7 +5326,7 @@ fn run_print_document_job(
     let started = Instant::now();
     let inputs = current_input_args(root, cfg, &job.cache_key, &job.current_json)?;
     let input_refs = input_arg_refs(&inputs);
-    compile_typst(
+    let dependencies = compile_typst(
         compiler,
         &job.input,
         &job.output_pdf,
@@ -5335,6 +5340,7 @@ fn run_print_document_job(
         duration: started.elapsed(),
         output_count: job.outputs.len(),
         generated: true,
+        dependencies,
     })
 }
 
@@ -5635,13 +5641,6 @@ fn prepare_print_document_jobs(
             if opts.explain && !opts.quiet {
                 print_explain("skip", &label, &decision.reasons);
             }
-            cache.entries.insert(
-                cache_key.clone(),
-                CacheEntry {
-                    hash: hash.clone(),
-                    outputs: outputs_to_strings(&outputs),
-                },
-            );
             stats.skipped += 1;
             continue;
         } else if opts.explain && !opts.quiet {
@@ -6539,8 +6538,7 @@ fn compile_typst(
     features: &str,
     label: String,
     inputs: &[(&str, &str)],
-) -> Result<Duration> {
-    let started = Instant::now();
+) -> Result<crate::compiler::Dependencies> {
     compiler
         .compile(input, output, format, features, inputs)
         .with_context(|| {
@@ -6549,8 +6547,7 @@ fn compile_typst(
                 input.display(),
                 output.display()
             )
-        })?;
-    Ok(started.elapsed())
+        })
 }
 
 fn bundle_source(
@@ -7059,6 +7056,7 @@ mod tests {
             CacheEntry {
                 hash: "hash".to_string(),
                 outputs: vec![output.to_string_lossy().to_string()],
+                dependencies: Some(Default::default()),
             },
         );
         let got = cache_decision(&cache, "page:index.typ", "hash", &[output], false);

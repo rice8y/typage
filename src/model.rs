@@ -159,6 +159,8 @@ pub struct BuildCache {
 pub struct CacheEntry {
     pub hash: String,
     pub outputs: Vec<String>,
+    #[serde(default)]
+    pub dependencies: Option<crate::compiler::Dependencies>,
 }
 
 #[derive(Debug, Default)]

@@ -37,6 +37,10 @@ pub const CORE: &[&str] = &[
     "paginate_by",
 ];
 
+/// Evaluates collection schemas and keeps native values alive through rendering.
+///
+/// Rust consumes exportable routing fields; templates receive original Typst
+/// values through the shared registry, including values JSON cannot represent.
 pub struct MetadataContext {
     compiler: Arc<Compiler>,
     schemas: Dict,
@@ -80,7 +84,8 @@ impl MetadataContext {
         let mut dependencies = Dependencies::new();
         let schemas = if path.exists() {
             let raw = std::fs::read_to_string(&path)?;
-            let source = format!("{raw}\n#let __typage_result = {{ let result = (:); for (name, schema) in collections {{ result.insert(name, if type(schema) == function {{ schema() }} else {{ schema }}) }}; result }}\n");
+            let source =
+                format!("{raw}\n#let __typage_result = __resolve-collections(collections)\n");
             let (module, deps) = compiler.evaluate(&path, &source, &helpers)?;
             dependencies.extend(deps);
             let Value::Dict(schemas) = exported(&module, "__typage_result")? else {
@@ -115,6 +120,8 @@ impl MetadataContext {
             .expect("dependencies poisoned")
             .clone()
     }
+    /// Fingerprints metadata inputs for the shared site graph, excluding bodies.
+    /// Imported metadata dependencies still invalidate all graph consumers.
     pub fn hash(&self) -> String {
         let values = self
             .values()
@@ -144,6 +151,10 @@ impl MetadataContext {
         exported(&module, "__typage_result")
     }
 
+    /// Evaluates one metadata source and returns the body without its directive.
+    ///
+    /// Schema validation and defaults happen before routing-field conversion.
+    /// TOML/directive mixtures and multiple directives are rejected as ambiguous.
     pub fn parse(&self, path: &Path, raw: &str, section: &str) -> Result<(FrontMatter, String)> {
         let normalized = raw.replace("\r\n", "\n");
         let (frontmatter, body) = if let Some(rest) = normalized.strip_prefix("---\n") {
@@ -194,6 +205,8 @@ impl MetadataContext {
             if range.start > 0 && body.as_bytes()[range.start - 1] == b'#' {
                 range.start -= 1;
             }
+            // Evaluate named arguments as a dictionary, not as a rendering call.
+            // Authors therefore need no `page` or `project` function in scope.
             let args = if args.trim() == "()" { "(:)" } else { &args };
             let prefix = metadata_prefix(body, range.start);
             let source = format!("{prefix}#let __typage_result = {args}\n");
@@ -273,6 +286,8 @@ impl MetadataContext {
                     continue;
                 }
             }
+            // Qualify registry keys by source so equal field names on different
+            // pages cannot overwrite each other during current-value hydration.
             let key = fingerprint(format!("{}:{name}", path.display()).as_bytes());
             self.values
                 .lock()

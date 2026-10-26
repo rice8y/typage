@@ -148,3 +148,56 @@ fn preserves_changes_during_hooks_and_honors_no_hooks() {
     thread::sleep(Duration::from_secs(1));
     assert!(!root.join("hook-unexpected").exists());
 }
+
+#[test]
+fn rebuilds_print_documents_with_page_current_and_relative_dependencies() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    assert!(Command::new(env!("CARGO_BIN_EXE_typage"))
+        .arg("init")
+        .arg(root)
+        .output()
+        .unwrap()
+        .status
+        .success());
+    let config_path = root.join("config.toml");
+    let config = fs::read_to_string(&config_path).unwrap();
+    fs::write(config_path, format!("{config}\n[[pdf_documents]]\npath = \"print.pdf\"\ntitle = \"Combined\"\ntemplate = \"print.typ\"\npages = [\"about.typ\"]\n")).unwrap();
+    fs::write(
+        root.join("content/about.typ"),
+        format!(
+            r#"
+#import "@local/typage:{}": current
+#show: page.with(title: "About")
+#context {{
+  assert(current.title == "About")
+  read("data" + ".txt")
+}}
+"#,
+            env!("CARGO_PKG_VERSION")
+        ),
+    )
+    .unwrap();
+    let dependency = root.join("content/data.txt");
+    fs::write(&dependency, "First dependency").unwrap();
+    let _child = Running(
+        Command::new(env!("CARGO_BIN_EXE_typage"))
+            .args(["watch", "--no-hooks", "--root"])
+            .arg(root)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let pdf = root.join("public/print.pdf");
+    let html = root.join("public/about/index.html");
+    wait_for("initial print", || {
+        pdf.exists() && contains(&html, "First dependency")
+    });
+    let original_pdf = fs::read(&pdf).unwrap();
+    fs::write(dependency, "Changed dependency").unwrap();
+    wait_for("updated print", || {
+        contains(&html, "Changed dependency")
+            && fs::read(&pdf).is_ok_and(|bytes| bytes != original_pdf)
+    });
+}

@@ -20,6 +20,18 @@ Each compile job has its own sources and inputs; fonts and package loading are s
 
 Compilation and publication remain target-specific. Normal builds cache individual HTML/PDF jobs; bundle export uses Typst's bundle target. Both stage compiler results before publishing. Metadata dependencies belong to the shared site graph, while page bodies belong to their own compile jobs, so a body-only edit does not invalidate unrelated pages unless it changes shared headings or other site data.
 
+Bundle pages and combined PDF bodies are first evaluated with their own page
+inputs, then composed as native Typst content. Module-scope imports of `current`
+in a page, template, or shared helper refer to that page, including when captured
+by a deferred `context` expression. Bundle-generated lists receive their own list
+metadata. In a print template, `current` describes the combined document instead.
+Native metadata types and dependencies from both evaluation and layout are
+preserved.
+
+Import page-dependent helpers at module scope, before entering deferred `context`
+blocks. An import first executed during the final layout uses the enclosing
+document's evaluation context; pass page metadata explicitly to such helpers.
+
 ## Watch and Live Reload
 
 `typage watch` and `typage serve --live-reload` share a build session. Saves are debounced after the last change, and changes arriving during compilation remain queued. The session watches configuration files, plugin configuration, source directories (including newly created directories), and recorded compiler dependencies. Configuration changes take effect on the next build, including a changed output directory in live preview.

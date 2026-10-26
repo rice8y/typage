@@ -2,7 +2,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
@@ -53,6 +52,14 @@ struct PreparedStarter {
     cleanup: Option<PathBuf>,
 }
 
+impl Drop for PreparedStarter {
+    fn drop(&mut self) {
+        if let Some(path) = &self.cleanup {
+            let _ = remove_dir_if_exists(path);
+        }
+    }
+}
+
 enum StarterSource {
     Local(PathBuf),
     Git { url: String, rev: Option<String> },
@@ -60,7 +67,7 @@ enum StarterSource {
 
 pub fn init(opts: StarterInitOptions) -> Result<()> {
     let root = normalize_path(&opts.root)?;
-    fs::create_dir_all(&root)
+    crate::util::create_dir_all_checked(&root)
         .with_context(|| format!("failed to create project root {}", root.display()))?;
     apply_starter(&root, &opts.source, opts.install_plugins, opts.force)?;
     println!("initialized {}", root.display());
@@ -83,6 +90,9 @@ fn apply_starter(root: &Path, source: &str, install_plugins: bool, force: bool) 
     let manifest = read_manifest(&prepared.root)?;
     ensure_min_typage(&manifest)?;
     let files_root = starter_files_root(&prepared.root, &manifest)?;
+    for (name, plugin) in &manifest.plugins {
+        plugin::validate_registration(root, name, plugin, force)?;
+    }
     let written = copy_starter_files(&files_root, root, &manifest, force)?;
 
     for (name, plugin) in manifest.plugins {
@@ -93,10 +103,6 @@ fn apply_starter(root: &Path, source: &str, install_plugins: bool, force: bool) 
             install: install_plugins,
             force,
         })?;
-    }
-
-    if let Some(path) = prepared.cleanup {
-        remove_dir_if_exists(&path)?;
     }
 
     let label = manifest.name.as_deref().unwrap_or(source);
@@ -126,11 +132,12 @@ fn prepare_source(source: &str) -> Result<PreparedStarter> {
         }
         StarterSource::Git { url, rev } => {
             let root = temp_starter_dir()?;
-            clone_starter(&url, rev.as_deref(), &root)?;
-            Ok(PreparedStarter {
+            let prepared = PreparedStarter {
                 root: root.clone(),
                 cleanup: Some(root),
-            })
+            };
+            clone_starter(&url, rev.as_deref(), &prepared.root)?;
+            Ok(prepared)
         }
     }
 }
@@ -194,13 +201,11 @@ fn validate_github_repo(repo: &str) -> Result<()> {
 }
 
 fn temp_starter_dir() -> Result<PathBuf> {
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    let path = std::env::temp_dir().join(format!("typage-starter-{}-{millis}", std::process::id()));
-    remove_dir_if_exists(&path)?;
-    Ok(path)
+    Ok(tempfile::Builder::new()
+        .prefix("typage-starter-")
+        .tempdir()?
+        .keep()
+        .canonicalize()?)
 }
 
 fn clone_starter(url: &str, rev: Option<&str>, dst: &Path) -> Result<()> {
@@ -258,12 +263,14 @@ fn starter_files_root(source_root: &Path, manifest: &StarterManifest) -> Result<
     if let Some(root) = &manifest.files.root {
         validate_project_path("files.root", root)?;
         let full = source_root.join(root);
+        crate::util::check_output_ancestors(&full.join(".probe"))?;
         if !full.is_dir() {
             bail!("starter files root does not exist: {}", full.display());
         }
         return Ok(full);
     }
     let files = source_root.join("files");
+    crate::util::check_output_ancestors(&files.join(".probe"))?;
     if files.is_dir() {
         Ok(files)
     } else {
@@ -283,7 +290,7 @@ fn copy_starter_files(
         .iter()
         .map(|path| normalized_project_path(path))
         .collect::<Result<BTreeSet<_>>>()?;
-    let mut written = 0usize;
+    let mut planned = Vec::new();
     for entry in walkdir::WalkDir::new(source) {
         let entry = entry?;
         let from = entry.path();
@@ -302,9 +309,14 @@ fn copy_starter_files(
         }
         let rel = normalized_project_path(rel)?;
         let to = target.join(&rel);
-        if copy_starter_file(from, &to, force)? {
-            written += 1;
+        if let Some(bytes) = plan_starter_file(from, &to, force)? {
+            planned.push((to, bytes));
         }
+    }
+    let written = planned.len();
+    for (to, bytes) in planned {
+        crate::util::write_bytes_if_changed(&to, &bytes)?;
+        println!("write {}", to.display());
     }
     Ok(written)
 }
@@ -323,14 +335,15 @@ fn is_excluded(path: &Path, excludes: &BTreeSet<PathBuf>) -> bool {
         .any(|exclude| path == exclude || path.starts_with(exclude))
 }
 
-fn copy_starter_file(from: &Path, to: &Path, force: bool) -> Result<bool> {
+fn plan_starter_file(from: &Path, to: &Path, force: bool) -> Result<Option<Vec<u8>>> {
+    crate::util::check_output_ancestors(to)?;
     let bytes = fs::read(from).with_context(|| format!("failed to read {}", from.display()))?;
     match fs::symlink_metadata(to) {
         Ok(meta) => {
             let kind = meta.file_type();
             if kind.is_file() {
                 if fs::read(to).unwrap_or_default() == bytes {
-                    return Ok(false);
+                    return Ok(None);
                 }
                 if !force {
                     bail!("refusing to overwrite existing file: {}", to.display());
@@ -339,8 +352,6 @@ fn copy_starter_file(from: &Path, to: &Path, force: bool) -> Result<bool> {
                 if !force {
                     bail!("refusing to overwrite existing symlink: {}", to.display());
                 }
-                fs::remove_file(to)
-                    .with_context(|| format!("failed to remove symlink {}", to.display()))?;
             } else {
                 bail!("refusing to overwrite non-file path: {}", to.display());
             }
@@ -348,13 +359,7 @@ fn copy_starter_file(from: &Path, to: &Path, force: bool) -> Result<bool> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
         Err(err) => return Err(err).with_context(|| format!("failed to inspect {}", to.display())),
     }
-    if let Some(parent) = to.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-    fs::write(to, bytes).with_context(|| format!("failed to write {}", to.display()))?;
-    println!("write {}", to.display());
-    Ok(true)
+    Ok(Some(bytes))
 }
 
 fn normalized_project_path(path: &Path) -> Result<PathBuf> {
@@ -390,6 +395,24 @@ fn validate_project_path(label: &str, path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preflights_all_files_before_copying() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("starter");
+        let target = tmp.path().join("target");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        fs::write(source.join("a.txt"), "new").unwrap();
+        fs::write(source.join("z.txt"), "replacement").unwrap();
+        fs::write(target.join("z.txt"), "existing").unwrap();
+        assert!(copy_starter_files(&source, &target, &StarterManifest::default(), false).is_err());
+        assert!(!target.join("a.txt").exists());
+        assert_eq!(
+            fs::read_to_string(target.join("z.txt")).unwrap(),
+            "existing"
+        );
+    }
     use crate::config::load_config;
 
     #[test]

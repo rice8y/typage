@@ -106,18 +106,38 @@ pub fn register(opts: PluginRegisterOptions) -> Result<()> {
     if !root.is_dir() {
         bail!("project root is not a directory: {}", root.display());
     }
-    let errors = validate_plugin_config(&opts.name, &opts.plugin);
-    if !errors.is_empty() {
-        bail!(
-            "invalid plugin configuration for {}\n\n{}",
-            opts.name,
-            errors.join("\n")
-        );
-    }
+    validate_registration(&root, &opts.name, &opts.plugin, opts.force)?;
     if opts.install && opts.plugin.command.is_none() {
         install_configured_plugin(&root, &opts.name, &opts.plugin, opts.force)?;
     }
     register_plugin(&root, &opts.name, opts.plugin, opts.force)
+}
+
+pub(crate) fn validate_registration(
+    root: &Path,
+    name: &str,
+    plugin: &PluginConfig,
+    force: bool,
+) -> Result<()> {
+    validate_plugin_name(name)?;
+    let errors = validate_plugin_config(name, plugin);
+    if !errors.is_empty() {
+        bail!(
+            "invalid plugin configuration for {}\n\n{}",
+            name,
+            errors.join("\n")
+        );
+    }
+    let path = plugin_file_path(root);
+    crate::util::check_output_ancestors(&path)?;
+    let file = read_plugin_file(&path)?;
+    if file.plugins.contains_key(name) && !force {
+        bail!(
+            "plugin {name:?} already exists in {}; pass --force to replace it",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 pub fn list(root: PathBuf) -> Result<()> {
@@ -358,6 +378,9 @@ fn register_plugin(root: &Path, name: &str, plugin: PluginConfig, force: bool) -
 }
 
 fn read_plugin_file(path: &Path) -> Result<PluginFile> {
+    if fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        bail!("refusing plugin configuration symlink {}", path.display());
+    }
     if !path.exists() {
         return Ok(PluginFile::default());
     }
@@ -368,7 +391,7 @@ fn read_plugin_file(path: &Path) -> Result<PluginFile> {
 
 fn write_plugin_file(path: &Path, file: &PluginFile) -> Result<()> {
     let raw = toml::to_string_pretty(file)?;
-    fs::write(path, raw).with_context(|| format!("failed to write {}", path.display()))
+    crate::util::write_if_changed(path, &raw)
 }
 
 fn plugin_file_path(root: &Path) -> PathBuf {

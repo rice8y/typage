@@ -913,6 +913,11 @@ pub fn doctor(root: PathBuf, drafts: bool) -> Result<()> {
     if let Err(err) = validate_routes(&pages, &generated) {
         errors.push(format!("route validation failed: {err:?}"));
     }
+    if let Err(err) =
+        validate_output_paths(&cfg, &static_roots, &out_root, &pages, &generated, false)
+    {
+        errors.push(format!("output validation failed: {err:?}"));
+    }
     if let Err(err) = template_hash(&templates_root, &cfg.list_template) {
         errors.push(format!("list template error: {err:?}"));
     }
@@ -1101,6 +1106,7 @@ pub fn build_site(opts: &BuildOptions) -> Result<BuildStats> {
     let summaries = pages.iter().map(Page::summary).collect::<Vec<_>>();
     let generated = make_generated_pages(&cfg, &out_root, &summaries, &section_meta);
     validate_routes(&pages, &generated)?;
+    validate_output_paths(&cfg, &static_roots, &out_root, &pages, &generated, opts.pdf)?;
     let site_data = site_data_typ(&cfg, &summaries, &generated, &section_meta);
     let site_graph_hash = hash_strs(&[&site_data]);
     write_if_changed(&data_path, &site_data)?;
@@ -1989,32 +1995,18 @@ fn validate_routes(pages: &[Page], generated: &[GeneratedPage]) -> Result<()> {
 fn validate_pdf_document_configs(
     cfg: &Config,
     templates_root: &Path,
-    static_roots: &[PathBuf],
+    _static_roots: &[PathBuf],
     out_root: &Path,
     pages: &[Page],
-    generated: &[GeneratedPage],
+    _generated: &[GeneratedPage],
     section_meta: &BTreeMap<String, FrontMatter>,
     drafts: bool,
 ) -> Vec<String> {
     let mut errors = Vec::<String>::new();
-    let mut outputs = collect_reserved_output_paths(static_roots, out_root, pages, generated)
-        .unwrap_or_else(|err| {
-            errors.push(format!("failed to inspect reserved outputs: {err:?}"));
-            BTreeMap::new()
-        });
     for (idx, doc) in cfg.pdf_documents.iter().enumerate() {
         let label = format!("pdf_documents[{idx}] ({})", pdf_document_label(doc));
-        match pdf_document_output_path(out_root, doc) {
-            Ok(output) => {
-                if let Err(err) = insert_output_path(
-                    &mut outputs,
-                    clean_path(&output),
-                    format!("pdf document {label}"),
-                ) {
-                    errors.push(err.to_string());
-                }
-            }
-            Err(err) => errors.push(format!("{label}: {err}")),
+        if let Err(err) = pdf_document_output_path(out_root, doc) {
+            errors.push(format!("{label}: {err}"));
         }
         if doc.template.trim().is_empty() {
             errors.push(format!("{label}: template must not be empty"));
@@ -2036,10 +2028,12 @@ fn validate_pdf_document_configs(
 }
 
 fn collect_reserved_output_paths(
+    cfg: &Config,
     static_roots: &[PathBuf],
     out_root: &Path,
     pages: &[Page],
     generated: &[GeneratedPage],
+    pdf: bool,
 ) -> Result<BTreeMap<PathBuf, String>> {
     let mut outputs = BTreeMap::<PathBuf, String>::new();
     for page in pages {
@@ -2048,11 +2042,20 @@ fn collect_reserved_output_paths(
             clean_path(&page.output_html),
             format!("page {}", page.source.display()),
         )?;
-        insert_output_path(
-            &mut outputs,
-            clean_path(&page.output_pdf),
-            format!("page PDF {}", page.source.display()),
-        )?;
+        if pdf || cfg.build_pdf || page.meta.build_pdf.unwrap_or(false) {
+            insert_output_path(
+                &mut outputs,
+                clean_path(&page.output_pdf),
+                format!("page PDF {}", page.source.display()),
+            )?;
+        }
+        for alias in &page.meta.aliases {
+            insert_output_path(
+                &mut outputs,
+                output_path_for_url(out_root, &alias_to_url(alias)?)?,
+                format!("alias {alias}"),
+            )?;
+        }
     }
     for gen in generated {
         insert_output_path(
@@ -2061,6 +2064,7 @@ fn collect_reserved_output_paths(
             format!("generated {}", gen.title),
         )?;
     }
+    let mut assets = BTreeMap::new();
     for static_root in static_roots {
         if !static_root.exists() {
             continue;
@@ -2069,15 +2073,65 @@ fn collect_reserved_output_paths(
             let entry = entry?;
             if entry.file_type().is_file() {
                 let rel = entry.path().strip_prefix(static_root)?;
-                insert_output_path(
-                    &mut outputs,
+                assets.insert(
                     clean_path(&out_root.join(rel)),
                     format!("static asset {}", entry.path().display()),
-                )?;
+                );
             }
         }
     }
+    for (path, label) in assets {
+        insert_output_path(&mut outputs, path, label)?;
+    }
     Ok(outputs)
+}
+
+fn validate_output_paths(
+    cfg: &Config,
+    static_roots: &[PathBuf],
+    out_root: &Path,
+    pages: &[Page],
+    generated: &[GeneratedPage],
+    pdf: bool,
+) -> Result<()> {
+    let mut outputs =
+        collect_reserved_output_paths(cfg, static_roots, out_root, pages, generated, pdf)?;
+    let mut reserve =
+        |path: PathBuf, label: String| insert_output_path(&mut outputs, clean_path(&path), label);
+    for doc in &cfg.pdf_documents {
+        reserve(
+            pdf_document_output_path(out_root, doc)?,
+            format!("pdf document {}", doc.path),
+        )?;
+    }
+    if cfg.sitemap && !cfg.base_url.trim().is_empty() {
+        reserve(out_root.join("sitemap.xml"), "sitemap".into())?;
+    }
+    if cfg.feed {
+        reserve(
+            public_file_path(out_root, &cfg.feed_path)?,
+            "RSS feed".into(),
+        )?;
+        if cfg.atom_feed {
+            reserve(
+                public_file_path(out_root, &cfg.atom_path)?,
+                "Atom feed".into(),
+            )?;
+        }
+        for feed in &cfg.feeds {
+            reserve(
+                public_file_path(out_root, &feed.path)?,
+                format!("feed {}", feed.path),
+            )?;
+        }
+    }
+    if cfg.robots {
+        reserve(out_root.join("robots.txt"), "robots".into())?;
+    }
+    if cfg.search.enabled {
+        reserve(out_root.join("search_index.json"), "search index".into())?;
+    }
+    Ok(())
 }
 
 fn insert_output_path(
@@ -2085,14 +2139,25 @@ fn insert_output_path(
     path: PathBuf,
     label: String,
 ) -> Result<()> {
-    if let Some(prev) = outputs.insert(path.clone(), label.clone()) {
+    let conflict = path
+        .ancestors()
+        .find_map(|ancestor| outputs.get_key_value(ancestor))
+        .or_else(|| {
+            outputs
+                .range(path.clone()..)
+                .next()
+                .filter(|(existing, _)| existing.starts_with(&path))
+        });
+    if let Some((existing, prev)) = conflict {
         bail!(
-            "output collision for {}: {} conflicts with {}",
+            "output collision for {}: {} ({}) conflicts with {}",
             path.display(),
             prev,
+            existing.display(),
             label
         );
     }
+    outputs.insert(path, label);
     Ok(())
 }
 
@@ -6847,8 +6912,15 @@ mod tests {
         let out_root = tmp.join("public");
         std::fs::create_dir_all(&static_root).unwrap();
         std::fs::write(static_root.join("print.pdf"), "static").unwrap();
-        let mut outputs =
-            collect_reserved_output_paths(&[static_root], &out_root, &[], &[]).unwrap();
+        let mut outputs = collect_reserved_output_paths(
+            &Config::default(),
+            &[static_root],
+            &out_root,
+            &[],
+            &[],
+            false,
+        )
+        .unwrap();
         let doc = PdfDocumentConfig {
             path: "print.pdf".to_string(),
             ..PdfDocumentConfig::default()
@@ -6862,6 +6934,45 @@ mod tests {
         .to_string();
         assert!(err.contains("output collision"));
         let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn output_registry_rejects_file_directory_conflicts_in_both_orders() {
+        for paths in [
+            ["public/docs", "public/docs/index.html"],
+            ["public/docs/index.html", "public/docs"],
+        ] {
+            let mut outputs = BTreeMap::new();
+            insert_output_path(&mut outputs, paths[0].into(), "first".into()).unwrap();
+            assert!(insert_output_path(&mut outputs, paths[1].into(), "second".into()).is_err());
+            assert_eq!(outputs.len(), 1);
+        }
+    }
+
+    #[test]
+    fn project_static_overrides_theme_static() {
+        let tmp = tempfile::tempdir().unwrap();
+        let theme = tmp.path().join("theme");
+        let project = tmp.path().join("static");
+        for dir in [&theme, &project] {
+            fs::create_dir_all(dir).unwrap();
+            fs::write(dir.join("style.css"), "body {}").unwrap();
+        }
+        let outputs = collect_reserved_output_paths(
+            &Config::default(),
+            &[theme, project.clone()],
+            &tmp.path().join("public"),
+            &[],
+            &[],
+            false,
+        )
+        .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert!(outputs
+            .values()
+            .next()
+            .unwrap()
+            .contains(&project.display().to_string()));
     }
 
     #[test]

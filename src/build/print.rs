@@ -5,7 +5,7 @@ use super::outputs::{
 use super::{
     absolute_url, assign_prev_next, build_link_map, cache_decision, cached_template_hash,
     compare_pages_for_sort, dependency_hash, discover_pages, is_expired_date, is_future_date,
-    page_dict, page_evaluation_context, page_include, preprocess_body, print_explain,
+    page_current_json, page_dict, page_evaluation_context, preprocess_body, print_explain,
     template_hash, templates_root, BuildOptions, ContentCollections, PrintDocumentJob,
     TYPAGE_VERSION,
 };
@@ -421,11 +421,15 @@ pub(super) fn prepare_print_document_jobs(
             // Keep the print-only page binding local to the source being included.
             context.sources.insert(
                 page.source.clone(),
-                format!("#let page = {}\n{body}", page_dict(page)),
+                format!("#let page = {}\n{body}", page_dict(page)).into(),
             );
         }
         jobs.push(PrintDocumentJob {
             context,
+            pages: selected_pages
+                .iter()
+                .map(|page| Ok((page.source.clone(), page_current_json(page)?)))
+                .collect::<Result<_>>()?,
             label,
             input: wrapper_path,
             output_pdf: output,
@@ -449,7 +453,7 @@ fn print_document_wrapper_path(
 }
 
 /// Places selected bodies in one Typst document using isolated content blocks.
-/// Bodies are included at their original paths through compiler source overlays.
+/// Bodies are evaluated separately with each page's current metadata.
 fn print_document_wrapper_source(
     root: &Path,
     cfg: &Config,
@@ -478,7 +482,7 @@ fn print_document_wrapper_source(
     let mut last_heading_section: Option<&str> = None;
 
     for (idx, page) in pages.iter().enumerate() {
-        let body = page_include(root, page)?;
+        let body = format!("#__typage_bodies.at({idx})\n");
         let has_section_heading = doc
             .section_headings
             .iter()

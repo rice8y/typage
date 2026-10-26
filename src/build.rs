@@ -90,6 +90,7 @@ struct CompileJob {
 #[derive(Debug, Clone)]
 struct PrintDocumentJob {
     context: compiler::EvaluationContext,
+    pages: Vec<(PathBuf, String)>,
     label: String,
     input: PathBuf,
     output_pdf: PathBuf,
@@ -861,14 +862,59 @@ pub fn bundle_site(root: PathBuf, drafts: bool) -> Result<()> {
         &bundle_path,
         &bundle_source(&root, &cfg, &data_path, &pages, &generated)?,
     )?;
-    let bundle_current = pages
-        .first()
-        .map(page_current_json)
-        .transpose()?
-        .unwrap_or_else(|| "{}".to_string());
-    let bundle_inputs = [("typage_current", bundle_current.as_str())];
     let compiler = Compiler::new(&root, cache_root.join("packages"))?;
     compiler.set_metadata(collections.values(), collections.dependencies());
+    let mut context = page_evaluation_context(&pages);
+    let mut documents = typst::foundations::Array::new();
+    let wrappers = cache_root.join("bundle-pages");
+    for page in &pages {
+        let wrapper_path = page_wrapper_path(&wrappers, page);
+        write_if_changed(
+            &wrapper_path,
+            &page_wrapper_source(&root, &cfg, &data_path, page, &wrapper_path)?,
+        )?;
+        let inputs = current_input_args(
+            &root,
+            &cfg,
+            &format!("bundle:{}", page.url),
+            &page_current_json(page)?,
+        )?;
+        let (body, dependencies) = compiler.evaluate_content(
+            &wrapper_path,
+            &cfg.bundle_features,
+            &input_arg_refs(&inputs),
+            &page_evaluation_context(std::slice::from_ref(page)),
+        )?;
+        documents.push(typst::foundations::Value::Content(body));
+        context.dependencies.extend(dependencies);
+    }
+    for gen in &generated {
+        let wrapper_path = cache_root
+            .join("generated")
+            .join(format!("{}.typ", slugify(&gen.url)));
+        write_if_changed(
+            &wrapper_path,
+            &generated_wrapper_source(&root, &cfg, &data_path, gen)?,
+        )?;
+        let inputs = current_input_args(
+            &root,
+            &cfg,
+            &format!("bundle:{}", gen.url),
+            &generated_current_json(gen, &cfg)?,
+        )?;
+        let (body, dependencies) = compiler.evaluate_content(
+            &wrapper_path,
+            &cfg.bundle_features,
+            &input_arg_refs(&inputs),
+            &compiler::EvaluationContext::default(),
+        )?;
+        documents.push(typst::foundations::Value::Content(body));
+        context.dependencies.extend(dependencies);
+    }
+    context.bindings.insert(
+        "__typage_documents".into(),
+        typst::foundations::Value::Array(documents),
+    );
     let staged = tempfile::Builder::new()
         .prefix("bundle-")
         .tempdir_in(&cache_root)?;
@@ -879,9 +925,9 @@ pub fn bundle_site(root: PathBuf, drafts: bool) -> Result<()> {
             output: staged.path(),
             format: "bundle",
             features: &cfg.bundle_features,
-            inputs: &bundle_inputs,
+            inputs: &[],
         },
-        &page_evaluation_context(&pages),
+        &context,
         "bundle",
     )?;
     copy_dir(staged.path(), &out_root)?;
@@ -2289,6 +2335,25 @@ fn run_print_document_job(
     let started = Instant::now();
     let inputs = current_input_args(root, cfg, &job.cache_key, &job.current_json)?;
     let input_refs = input_arg_refs(&inputs);
+    let mut context = job.context.clone();
+    let mut bodies = typst::foundations::Array::new();
+    for (index, (source, current_json)) in job.pages.iter().enumerate() {
+        let inputs = current_input_args(
+            root,
+            cfg,
+            &format!("{}:{index}", job.cache_key),
+            current_json,
+        )?;
+        let (body, dependencies) = compiler
+            .evaluate_content(source, "", &input_arg_refs(&inputs), &job.context)
+            .with_context(|| format!("failed to evaluate print page {}", source.display()))?;
+        bodies.push(typst::foundations::Value::Content(body));
+        context.dependencies.extend(dependencies);
+    }
+    context.bindings.insert(
+        "__typage_bodies".into(),
+        typst::foundations::Value::Array(bodies),
+    );
     let dependencies = compile_typst(
         compiler,
         compiler::CompileRequest {
@@ -2298,7 +2363,7 @@ fn run_print_document_job(
             features: "",
             inputs: &input_refs,
         },
-        &job.context,
+        &context,
         &job.label,
     )?;
     Ok(CompileReport {
@@ -2450,7 +2515,7 @@ fn cfg_hash(cfg: &Config) -> String {
     serde_json::to_string(&(
         cfg,
         TYPAGE_VERSION,
-        "source-context-v1",
+        "source-context-v2",
         compiler::VERSION,
         env,
     ))
@@ -2511,8 +2576,9 @@ fn page_evaluation_context(pages: &[Page]) -> compiler::EvaluationContext {
     compiler::EvaluationContext {
         sources: pages
             .iter()
-            .map(|page| (page.source.clone(), page.processed_body.clone()))
+            .map(|page| (page.source.clone(), page.processed_body.clone().into()))
             .collect(),
+        ..Default::default()
     }
 }
 
@@ -2585,27 +2651,6 @@ fn nav_dict(title: &Option<String>, url: &Option<String>) -> String {
         ),
         _ => "none".to_string(),
     }
-}
-
-fn generated_page_dict(gen: &GeneratedPage, cfg: &Config) -> String {
-    let items = typst_tuple(gen.items.iter().map(summary_dict).collect::<Vec<_>>());
-    format!(
-        "(kind: {}, title: {}, description: {}, date: none, updated: none, weight: none, lang: {}, url: {}, canonical_url: {}, current_url: {}, slug: none, path: {}, file_path: none, source: none, section: {}, parent_section: none, ancestors: (), tags: (), categories: (), aliases: (), toc: (), prev: {}, next: {}, items: {}, page_number: {}, total_pages: {})",
-        typst_string(&gen.kind),
-        typst_string(&gen.title),
-        typst_opt_string(&gen.description),
-        typst_string(&cfg.lang),
-        typst_string(&gen.url),
-        typst_string(&gen.url),
-        typst_string(&gen.url),
-        typst_string(gen.url.trim_matches('/')),
-        typst_string(&gen.kind),
-        nav_dict(&gen.prev_title, &gen.prev_url),
-        nav_dict(&gen.next_title, &gen.next_url),
-        items,
-        gen.page_number,
-        gen.total_pages,
-    )
 }
 
 fn summary_dict(page: &PageSummary) -> String {
@@ -2917,61 +2962,30 @@ fn compile_typst(
 fn bundle_source(
     root: &Path,
     cfg: &Config,
-    data_path: &Path,
+    _data_path: &Path,
     pages: &[Page],
     generated: &[GeneratedPage],
 ) -> Result<String> {
     let bundle_dir = root.join(&cfg.cache_dir);
-    let data_rel = relative_path(&bundle_dir, data_path)?;
     let mut out = String::new();
     out.push_str("// Generated by typage. Experimental Typst bundle export.\n");
-    out.push_str(&format!(
-        "#import {}: site, pages, taxonomies\n",
-        typst_string(&to_posix_path(&data_rel))
-    ));
-    for page in pages {
-        let template_path = templates_root(root, cfg).join(&page.template);
-        let template_rel = relative_path(&bundle_dir, &template_path)?;
-        let out_path = page.url.trim_start_matches('/').trim_end_matches('/');
+    // Bodies and templates have already captured their own current-page values.
+    for (index, url) in pages
+        .iter()
+        .map(|page| &page.url)
+        .chain(generated.iter().map(|page| &page.url))
+        .enumerate()
+    {
+        let out_path = url.trim_start_matches('/').trim_end_matches('/');
         let html_path = if out_path.is_empty() {
             "index.html".to_string()
         } else {
             format!("{out_path}/index.html")
         };
-        out.push_str(&format!("#document({})[\n", typst_string(&html_path)));
         out.push_str(&format!(
-            "  #import {}: render\n",
-            typst_string(&to_posix_path(&template_rel))
+            "#document({})[#__typage_documents.at({index})]\n",
+            typst_string(&html_path)
         ));
-        out.push_str(&format!("  #let current = {}\n", page_dict(page)));
-        out.push_str("  #let __typage_current = current\n");
-        out.push_str("  #let asset = path => if site.base_url == \"\" { path } else { site.base_url + path }\n");
-        out.push_str("  #show: render.with(site: site, page: current, pages: pages, taxonomies: taxonomies)\n");
-        let body = page_include(root, page)?;
-        out.push_str(&body);
-        out.push_str("\n]\n");
-    }
-    for gen in generated {
-        let template_path = templates_root(root, cfg).join(&cfg.list_template);
-        let template_rel = relative_path(&bundle_dir, &template_path)?;
-        let out_path = gen.url.trim_start_matches('/').trim_end_matches('/');
-        let html_path = if out_path.is_empty() {
-            "index.html".to_string()
-        } else {
-            format!("{out_path}/index.html")
-        };
-        out.push_str(&format!("#document({})[\n", typst_string(&html_path)));
-        out.push_str(&format!(
-            "  #import {}: render\n",
-            typst_string(&to_posix_path(&template_rel))
-        ));
-        out.push_str(&format!(
-            "  #let current = {}\n",
-            generated_page_dict(gen, cfg)
-        ));
-        out.push_str("  #let asset = path => if site.base_url == \"\" { path } else { site.base_url + path }\n");
-        out.push_str("  #show: render.with(site: site, page: current, pages: pages, taxonomies: taxonomies)\n");
-        out.push_str("]\n");
     }
     for (relative, source) in static_assets(&static_roots(root, cfg))? {
         let src_rel = relative_path(&bundle_dir, &source)?;

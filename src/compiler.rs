@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use anyhow::{bail, Context, Result};
 use comemo::Track;
 use typst::diag::{FileError, FileResult, SourceDiagnostic, SourceResult};
-use typst::foundations::{Binding, Bytes, Datetime, Dict, Duration, IntoValue, Module};
+use typst::foundations::{Binding, Bytes, Content, Datetime, Dict, Duration, IntoValue, Module};
 use typst::syntax::{FileId, RootedPath, Source, VirtualPath, VirtualRoot};
 use typst::text::{Font, FontBook};
 use typst::utils::LazyHash;
@@ -238,6 +238,43 @@ impl Compiler {
         Ok(dependencies)
     }
 
+    /// Evaluate content in a page-specific library before composing documents.
+    /// Native content preserves captured metadata and deferred layout expressions.
+    pub fn evaluate_content(
+        &self,
+        input: &Path,
+        features: &str,
+        inputs: &[(&str, &str)],
+        context: &EvaluationContext,
+    ) -> Result<(Content, Dependencies)> {
+        use typst::engine::{Route, Sink, Traced};
+        let mut world = CompileWorld::new(self, input, features, inputs)?;
+        world.set_context(context)?;
+        let source = world
+            .source(world.main)
+            .map_err(|err| anyhow::anyhow!("{}: {err}", input.display()))?;
+        let mut sink = Sink::new();
+        let result = typst_eval::eval(
+            (&world as &dyn World).track(),
+            &world.library,
+            Traced::default().track(),
+            sink.track_mut(),
+            Route::default().track(),
+            &source,
+        );
+        let content = world.result(result)?.content();
+        let warnings = sink.warnings();
+        if !warnings.is_empty() {
+            eprint!("{}", world.diagnostics(&warnings));
+        }
+        let dependencies = world
+            .dependencies
+            .lock()
+            .expect("dependencies poisoned")
+            .clone();
+        Ok((content, dependencies))
+    }
+
     fn pdf_options(&self) -> typst_pdf::PdfOptions {
         use chrono::{Datelike, Timelike};
         let now = self
@@ -299,7 +336,38 @@ pub fn features(value: &str) -> Result<Features> {
 /// Each compilation owns its overlays; raw file reads still see disk bytes.
 #[derive(Clone, Debug, Default)]
 pub struct EvaluationContext {
-    pub sources: BTreeMap<PathBuf, String>,
+    pub sources: BTreeMap<PathBuf, SourceOverlay>,
+    pub bindings: Dict,
+    pub dependencies: Dependencies,
+}
+
+/// Share processed text across page worlds and parse only sources they use.
+#[derive(Clone, Debug)]
+pub struct SourceOverlay {
+    text: Arc<str>,
+    parsed: Arc<OnceLock<Source>>,
+}
+
+impl From<String> for SourceOverlay {
+    fn from(text: String) -> Self {
+        Self {
+            text: text.into(),
+            parsed: Arc::new(OnceLock::new()),
+        }
+    }
+}
+
+impl SourceOverlay {
+    fn source(&self, id: FileId) -> Source {
+        let source = self
+            .parsed
+            .get_or_init(|| Source::new(id, self.text.to_string()));
+        if source.id() == id {
+            source.clone()
+        } else {
+            Source::new(id, self.text.to_string())
+        }
+    }
 }
 
 pub struct CompileRequest<'a> {
@@ -318,7 +386,7 @@ struct CompileWorld<'a> {
     time: Time,
     dependencies: Arc<Mutex<Dependencies>>,
     overlay: Option<Source>,
-    sources: HashMap<FileId, Source>,
+    sources: HashMap<FileId, SourceOverlay>,
 }
 
 impl<'a> CompileWorld<'a> {
@@ -369,11 +437,23 @@ impl<'a> CompileWorld<'a> {
     }
 
     fn set_context(&mut self, context: &EvaluationContext) -> Result<()> {
-        for (path, text) in &context.sources {
+        let mut library = (*self.library).clone();
+        for (name, value) in context.bindings.iter() {
+            library
+                .global
+                .scope_mut()
+                .bind(name.clone().into(), Binding::detached(value.clone()));
+        }
+        self.library = LazyHash::new(library);
+        self.dependencies
+            .lock()
+            .expect("dependencies poisoned")
+            .extend(context.dependencies.clone());
+        for (path, source) in &context.sources {
             let path = self.compiler.root.join(path);
             let virtual_path = VirtualPath::virtualize(&self.compiler.root, &path)?;
             let id = RootedPath::new(VirtualRoot::Project, virtual_path).intern();
-            self.sources.insert(id, Source::new(id, text.clone()));
+            self.sources.insert(id, source.clone());
         }
         Ok(())
     }
@@ -419,7 +499,7 @@ impl World for CompileWorld<'_> {
             // Run the normal confined loader even for overlays: validate symlinks
             // and fingerprint the original file for cache/watch invalidation.
             self.files.file(id)?;
-            return Ok(source.clone());
+            return Ok(source.source(id));
         }
         if id == self.main {
             if let Some(source) = &self.overlay {
@@ -707,7 +787,8 @@ mod tests {
         let input = compiler.root.join("main.typ");
         fs::write(&input, "Original bytes").unwrap();
         let context = EvaluationContext {
-            sources: BTreeMap::from([(input.clone(), "Processed content".into())]),
+            sources: BTreeMap::from([(input.clone(), "Processed content".to_string().into())]),
+            ..Default::default()
         };
         let mut world = CompileWorld::new(&compiler, &input, "html", &[]).unwrap();
         world.set_context(&context).unwrap();
@@ -735,7 +816,11 @@ mod tests {
             Err(FileError::AccessDenied)
         ));
         let outside_context = EvaluationContext {
-            sources: BTreeMap::from([(outside.path().join("other.typ"), "Outside".into())]),
+            sources: BTreeMap::from([(
+                outside.path().join("other.typ"),
+                "Outside".to_string().into(),
+            )]),
+            ..Default::default()
         };
         assert!(world.set_context(&outside_context).is_err());
     }

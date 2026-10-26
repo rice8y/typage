@@ -3,7 +3,6 @@ use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -14,6 +13,7 @@ use serde_json::json;
 use typst_syntax::ast::{self, AstNode};
 use typst_syntax::{is_ident, LinkedNode};
 
+use crate::compiler::{self, Compiler};
 use crate::config::{load_config, Config, FeedConfig, PdfDocumentConfig, SearchConfig};
 use crate::model::{
     BuildCache, BuildStats, CacheEntry, FrontMatter, GeneratedPage, MetadataField, Page,
@@ -26,8 +26,6 @@ use crate::util::{
     typst_tuple, write_if_changed,
 };
 
-const MIN_TYPST_VERSION: (u64, u64, u64) = (0, 15, 0);
-const MIN_TYPST_VERSION_DISPLAY: &str = "0.15.0";
 const TYPAGE_VERSION: &str = env!("CARGO_PKG_VERSION");
 const INLINE_TYPAGE_CURRENT_LIMIT: usize = 32 * 1024;
 
@@ -36,7 +34,6 @@ pub struct BuildOptions {
     pub root: PathBuf,
     pub drafts: bool,
     pub force: bool,
-    pub typst_override: Option<String>,
     pub pdf: bool,
     pub keep_going: bool,
     pub jobs: Option<usize>,
@@ -779,12 +776,9 @@ pub fn new_page(
     Ok(())
 }
 
-pub fn doctor(root: PathBuf, typst_override: Option<String>, drafts: bool) -> Result<()> {
+pub fn doctor(root: PathBuf, drafts: bool) -> Result<()> {
     let root = normalize_path(&root)?;
-    let mut cfg = load_config(&root)?;
-    if let Some(typst) = typst_override {
-        cfg.typst = typst;
-    }
+    let cfg = load_config(&root)?;
     let content_root = root.join(&cfg.content_dir);
     let templates_root = templates_root(&root, &cfg);
     let static_roots = static_roots(&root, &cfg);
@@ -801,11 +795,14 @@ pub fn doctor(root: PathBuf, typst_override: Option<String>, drafts: bool) -> Re
 
     println!("root: {}", root.display());
     println!("config: {}", root.join("config.toml").display());
-    match check_typst_requirement(&cfg.typst) {
-        Ok(version) => {
-            println!("typst: ok ({version}; requires {MIN_TYPST_VERSION_DISPLAY} or later)")
+    println!("typst: embedded {}", compiler::VERSION);
+    if let Err(err) = Compiler::new(&root, root.join(&cfg.cache_dir).join("packages")) {
+        errors.push(format!("embedded compiler: {err}"));
+    }
+    for flags in [&cfg.features, &cfg.bundle_features] {
+        if let Err(err) = compiler::features(flags) {
+            errors.push(err.to_string());
         }
-        Err(err) => errors.push(err.to_string()),
     }
     for (name, path) in [("content", &content_root), ("templates", &templates_root)] {
         if path.exists() {
@@ -965,54 +962,6 @@ pub fn doctor(root: PathBuf, typst_override: Option<String>, drafts: bool) -> Re
     }
 }
 
-fn check_typst_requirement(typst: &str) -> Result<String> {
-    let out = Command::new(typst)
-        .arg("--version")
-        .output()
-        .with_context(|| format!("failed to run typst command {typst:?}"))?;
-    if !out.status.success() {
-        bail!(
-            "typst command exited with {}: {}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-    let reported = if stdout.is_empty() { &stderr } else { &stdout };
-    let version = parse_typst_version(reported).ok_or_else(|| {
-        anyhow::anyhow!("failed to parse typst version from output: {reported:?}")
-    })?;
-    if version < MIN_TYPST_VERSION {
-        bail!(
-            "Typst {MIN_TYPST_VERSION_DISPLAY} or later is required; found {reported}. Typage uses Typst HTML export and bundle export features."
-        );
-    }
-    Ok(reported.to_string())
-}
-
-fn parse_typst_version(output: &str) -> Option<(u64, u64, u64)> {
-    output.split_whitespace().find_map(|token| {
-        let token = token.strip_prefix('v').unwrap_or(token);
-        let mut parts = token.split('.');
-        let major = parse_version_component(parts.next()?)?;
-        let minor = parse_version_component(parts.next()?)?;
-        let patch = parse_version_component(parts.next()?)?;
-        Some((major, minor, patch))
-    })
-}
-
-fn parse_version_component(component: &str) -> Option<u64> {
-    let digits = component
-        .chars()
-        .take_while(|ch| ch.is_ascii_digit())
-        .collect::<String>();
-    if digits.is_empty() {
-        return None;
-    }
-    digits.parse().ok()
-}
-
 fn validate_relative_content_path(path: &Path) -> Result<()> {
     for component in path.components() {
         match component {
@@ -1080,11 +1029,8 @@ fn remove_page_wrappers(content_root: &Path) -> Result<()> {
 
 pub fn build_site(opts: &BuildOptions) -> Result<BuildStats> {
     let root = normalize_path(&opts.root)?;
-    let mut cfg = load_config(&root)?;
-    if let Some(typst) = &opts.typst_override {
-        cfg.typst = typst.clone();
-    }
-    check_typst_requirement(&cfg.typst)?;
+    let cfg = load_config(&root)?;
+    compiler::features(&cfg.features)?;
     let started = Instant::now();
     let cfg_hash_str = cfg_hash(&cfg);
     let mut template_hashes = BTreeMap::<String, String>::new();
@@ -1317,9 +1263,15 @@ pub fn build_site(opts: &BuildOptions) -> Result<BuildStats> {
         !opts.quiet && !opts.verbose && total_compile_jobs > 0,
     );
     progress.draw();
-    let outcomes = run_compile_jobs(&cfg, &root, compile_jobs, compile_concurrency, || {
-        progress.advance()
-    });
+    let compiler = Arc::new(Compiler::new(&root, cache_root.join("packages"))?);
+    let outcomes = run_compile_jobs(
+        &cfg,
+        &root,
+        &compiler,
+        compile_jobs,
+        compile_concurrency,
+        || progress.advance(),
+    );
     let compile_wall = compile_started.elapsed();
     let mut reports = Vec::<CompileReport>::new();
     for (job, result) in outcomes {
@@ -1367,7 +1319,7 @@ pub fn build_site(opts: &BuildOptions) -> Result<BuildStats> {
     }
 
     for job in print_jobs {
-        let result = run_print_document_job(&cfg, &root, &job);
+        let result = run_print_document_job(&cfg, &root, &compiler, &job);
         progress.advance();
         match result {
             Ok(report) => {
@@ -1451,13 +1403,9 @@ pub fn build_site(opts: &BuildOptions) -> Result<BuildStats> {
     Ok(stats)
 }
 
-pub fn bundle_site(root: PathBuf, drafts: bool, typst_override: Option<String>) -> Result<()> {
+pub fn bundle_site(root: PathBuf, drafts: bool) -> Result<()> {
     let root = normalize_path(&root)?;
-    let mut cfg = load_config(&root)?;
-    if let Some(typst) = typst_override {
-        cfg.typst = typst;
-    }
-    check_typst_requirement(&cfg.typst)?;
+    let cfg = load_config(&root)?;
     let content_root = root.join(&cfg.content_dir);
     let out_root = root.join(&cfg.out_dir);
     let cache_root = root.join(&cfg.cache_dir);
@@ -1517,9 +1465,9 @@ pub fn bundle_site(root: PathBuf, drafts: bool, typst_override: Option<String>) 
         .transpose()?
         .unwrap_or_else(|| "{}".to_string());
     let bundle_inputs = [("typage_current", bundle_current.as_str())];
+    let compiler = Compiler::new(&root, cache_root.join("packages"))?;
     compile_typst(
-        &cfg,
-        &root,
+        &compiler,
         &bundle_path,
         &out_root,
         "bundle",
@@ -5242,6 +5190,7 @@ fn effective_jobs(cli_jobs: Option<usize>, cfg_jobs: usize, job_count: usize) ->
 fn run_compile_jobs(
     cfg: &Config,
     root: &Path,
+    compiler: &Arc<Compiler>,
     jobs: Vec<CompileJob>,
     concurrency: usize,
     mut on_complete: impl FnMut(),
@@ -5252,7 +5201,7 @@ fn run_compile_jobs(
     if concurrency <= 1 {
         let mut outcomes = Vec::with_capacity(jobs.len());
         for job in jobs {
-            let result = run_compile_job(cfg, root, &job);
+            let result = run_compile_job(cfg, root, compiler, &job);
             on_complete();
             outcomes.push((job, result));
         }
@@ -5268,12 +5217,13 @@ fn run_compile_jobs(
         let out_tx = out_tx.clone();
         let cfg = cfg.clone();
         let root = root.to_path_buf();
+        let compiler = Arc::clone(compiler);
         thread::spawn(move || loop {
             let next = { job_rx.lock().expect("compile job receiver poisoned").recv() };
             let Ok(job) = next else {
                 break;
             };
-            let result = run_compile_job(&cfg, &root, &job);
+            let result = run_compile_job(&cfg, &root, &compiler, &job);
             let _ = out_tx.send((job, result));
         });
     }
@@ -5325,13 +5275,17 @@ fn input_arg_refs(inputs: &[(String, String)]) -> Vec<(&str, &str)> {
         .collect()
 }
 
-fn run_compile_job(cfg: &Config, root: &Path, job: &CompileJob) -> Result<CompileReport> {
+fn run_compile_job(
+    cfg: &Config,
+    root: &Path,
+    compiler: &Compiler,
+    job: &CompileJob,
+) -> Result<CompileReport> {
     let started = Instant::now();
     let inputs = current_input_args(root, cfg, &job.cache_key, &job.current_json)?;
     let input_refs = input_arg_refs(&inputs);
     compile_typst(
-        cfg,
-        root,
+        compiler,
         &job.input,
         &job.html_output,
         "html",
@@ -5341,8 +5295,7 @@ fn run_compile_job(cfg: &Config, root: &Path, job: &CompileJob) -> Result<Compil
     )?;
     if let Some(pdf_output) = &job.pdf_output {
         compile_typst(
-            cfg,
-            root,
+            compiler,
             &job.input,
             pdf_output,
             "pdf",
@@ -5362,14 +5315,14 @@ fn run_compile_job(cfg: &Config, root: &Path, job: &CompileJob) -> Result<Compil
 fn run_print_document_job(
     cfg: &Config,
     root: &Path,
+    compiler: &Compiler,
     job: &PrintDocumentJob,
 ) -> Result<CompileReport> {
     let started = Instant::now();
     let inputs = current_input_args(root, cfg, &job.cache_key, &job.current_json)?;
     let input_refs = input_arg_refs(&inputs);
     compile_typst(
-        cfg,
-        root,
+        compiler,
         &job.input,
         &job.output_pdf,
         "pdf",
@@ -5512,7 +5465,22 @@ fn write_cache(path: &Path, cache: &BuildCache) -> Result<()> {
 }
 
 fn cfg_hash(cfg: &Config) -> String {
-    serde_json::to_string(cfg).unwrap_or_default()
+    let env = [
+        "TYPST_FONT_PATHS",
+        "TYPST_IGNORE_SYSTEM_FONTS",
+        "TYPST_IGNORE_EMBEDDED_FONTS",
+        "TYPST_PACKAGE_PATH",
+        "TYPST_PACKAGE_CACHE_PATH",
+        "SOURCE_DATE_EPOCH",
+    ]
+    .map(|key| {
+        (
+            key,
+            std::env::var_os(key).map(|value| value.to_string_lossy().into_owned()),
+        )
+    });
+    serde_json::to_string(&(cfg, TYPAGE_VERSION, "embedded", compiler::VERSION, env))
+        .unwrap_or_default()
 }
 
 fn cached_template_hash(
@@ -6564,8 +6532,7 @@ description = "Virtual active theme component package generated by typage."
 }
 
 fn compile_typst(
-    cfg: &Config,
-    root: &Path,
+    compiler: &Compiler,
     input: &Path,
     output: &Path,
     format: &str,
@@ -6573,63 +6540,17 @@ fn compile_typst(
     label: String,
     inputs: &[(&str, &str)],
 ) -> Result<Duration> {
-    if let Some(parent) = output.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    prepare_output_file(output)?;
-    let mut cmd = Command::new(&cfg.typst);
-    cmd.current_dir(root).arg("compile").arg("--root").arg(root);
-    let package_path = root.join(&cfg.cache_dir).join("packages");
-    if package_path.exists() {
-        cmd.arg("--package-path").arg(&package_path);
-    }
-    for (key, value) in inputs {
-        cmd.arg("--input").arg(format!("{key}={value}"));
-    }
-    if !features.is_empty() {
-        cmd.arg("--features").arg(features);
-    }
-    cmd.arg("--format").arg(format).arg(input).arg(output);
-    let rendered_cmd = format!("{:?}", cmd);
     let started = Instant::now();
-    let out = cmd
-        .output()
-        .with_context(|| format!("failed to start typst for {label}"))?;
-    let elapsed = started.elapsed();
-    if !out.status.success() {
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        bail!(
-            "typst failed for {label}\ncommand: {rendered_cmd}\ninput: {}\noutput: {}\nstatus: {}\n--- stdout ---\n{}\n--- stderr ---\n{}",
-            input.display(),
-            output.display(),
-            out.status,
-            stdout,
-            stderr,
-        );
-    }
-    Ok(elapsed)
-}
-
-fn prepare_output_file(path: &Path) -> Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(meta) => {
-            let file_type = meta.file_type();
-            if file_type.is_symlink() {
-                fs::remove_file(path).with_context(|| {
-                    format!("failed to remove stale output symlink {}", path.display())
-                })?;
-            } else if !file_type.is_file() {
-                bail!("refusing to overwrite non-file output {}", path.display());
-            }
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => {
-            return Err(err)
-                .with_context(|| format!("failed to inspect output path {}", path.display()));
-        }
-    }
-    Ok(())
+    compiler
+        .compile(input, output, format, features, inputs)
+        .with_context(|| {
+            format!(
+                "Typst compilation failed for {label}\ninput: {}\noutput: {}",
+                input.display(),
+                output.display()
+            )
+        })?;
+    Ok(started.elapsed())
 }
 
 fn bundle_source(
@@ -6727,16 +6648,6 @@ mod tests {
     use super::*;
     use crate::config::{Config, FeedConfig};
     use std::path::Path;
-
-    #[test]
-    fn parses_typst_versions() {
-        assert_eq!(
-            parse_typst_version("typst 0.15.0 (unknown commit)"),
-            Some((0, 15, 0))
-        );
-        assert_eq!(parse_typst_version("typst v0.16.1-dev"), Some((0, 16, 1)));
-        assert_eq!(parse_typst_version("typst unknown"), None);
-    }
 
     fn page_summary(title: &str, url: &str, section: &str, date: &str) -> PageSummary {
         PageSummary {
@@ -7177,7 +7088,7 @@ mod tests {
         let output = public.join("index.html");
         symlink(&target, &output).unwrap();
 
-        prepare_output_file(&output).unwrap();
+        compiler::prepare_output_file(&output).unwrap();
         assert!(std::fs::symlink_metadata(&output).is_err());
         assert!(!target.exists());
         let _ = std::fs::remove_dir_all(tmp);

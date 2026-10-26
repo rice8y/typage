@@ -8,7 +8,6 @@ use crate::config::load_config;
 use crate::term;
 use crate::util::{normalize_path, write_if_changed};
 
-const TYPST_CLI_VERSION: &str = "0.15.0";
 const TYPAGE_INSTALL_COMMAND: &str = "cargo install typage --locked";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -246,9 +245,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: typst-community/setup-typst@v4
-        with:
-          typst-version: {TYPST_CLI_VERSION}
       - name: Install typage
         run: {typage_install}
       - name: Build site
@@ -272,11 +268,10 @@ jobs:
 
 fn cloudflare_wrangler(out_dir: &Path) -> String {
     let out = path_for_toml(out_dir);
-    let typst_install = typst_install_command();
     let typage_install = TYPAGE_INSTALL_COMMAND;
     format!(
         r#"# Cloudflare Pages scaffold for typage.
-# Install command: {typst_install} && {typage_install}
+# Install command: {typage_install}
 # Build command: typage build --force --jobs 0
 # Output directory: {out}
 #
@@ -295,8 +290,8 @@ fn netlify_toml(out_dir: &Path) -> String {
     let install = install_command();
     format!(
         r#"# Netlify scaffold for typage.
-# Installs Typst CLI {TYPST_CLI_VERSION} and typage before building.
-# Replace this command if your build image provides them another way.
+# Installs typage, including its embedded Typst compiler, before building.
+# Replace this command if your build image provides typage another way.
 
 [build]
 command = "{install} && typage build --force --jobs 0"
@@ -320,12 +315,8 @@ fn vercel_json(out_dir: &Path) -> String {
     )
 }
 
-fn typst_install_command() -> String {
-    format!("cargo install typst-cli --locked --version {TYPST_CLI_VERSION}")
-}
-
 fn install_command() -> String {
-    format!("{} && {TYPAGE_INSTALL_COMMAND}", typst_install_command())
+    TYPAGE_INSTALL_COMMAND.to_string()
 }
 
 fn path_for_yaml(path: &Path) -> String {
@@ -376,8 +367,7 @@ mod tests {
         .unwrap();
         assert!(root.join(".github/workflows/deploy.yml").exists());
         let workflow = fs::read_to_string(root.join(".github/workflows/deploy.yml")).unwrap();
-        assert!(workflow.contains("uses: typst-community/setup-typst@v4"));
-        assert!(workflow.contains("typst-version: 0.15.0"));
+        assert!(!workflow.contains("setup-typst"));
         assert!(workflow.contains("run: cargo install typage --locked"));
         assert!(root.join("static/.nojekyll").exists());
         assert_eq!(
@@ -394,7 +384,7 @@ mod tests {
         let path = root.join("vercel.json");
         assert!(path.exists());
         let raw = fs::read_to_string(path).unwrap();
-        assert!(raw.contains("cargo install typst-cli --locked --version 0.15.0"));
+        assert!(!raw.contains("typst-cli"));
         assert!(raw.contains("cargo install typage --locked"));
         assert!(raw.contains("\"buildCommand\": \"typage build --force --jobs 0\""));
         assert!(raw.contains("\"outputDirectory\": \"public\""));
@@ -403,11 +393,11 @@ mod tests {
     }
 
     #[test]
-    fn netlify_scaffold_installs_typst_and_typage() {
+    fn netlify_scaffold_installs_typage_with_embedded_compiler() {
         let root = temp_project("netlify");
         init(root.clone(), DeployTarget::Netlify, None, false).unwrap();
         let raw = fs::read_to_string(root.join("netlify.toml")).unwrap();
-        assert!(raw.contains("cargo install typst-cli --locked --version 0.15.0"));
+        assert!(!raw.contains("typst-cli"));
         assert!(raw.contains("cargo install typage --locked"));
         assert!(raw.contains("typage build --force --jobs 0"));
         let _ = fs::remove_dir_all(root);

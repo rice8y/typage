@@ -1,4 +1,5 @@
 mod build;
+mod compiler;
 mod config;
 mod deploy;
 mod model;
@@ -67,12 +68,10 @@ enum Command {
         #[arg(long)]
         draft: bool,
     },
-    /// Check configuration, routes, links, and Typst availability without building.
+    /// Check configuration, routes, links, and embedded compiler settings without building.
     Doctor {
         #[arg(long, default_value = ".")]
         root: PathBuf,
-        #[arg(long)]
-        typst: Option<String>,
         #[arg(long)]
         drafts: bool,
     },
@@ -109,8 +108,6 @@ enum Command {
         drafts: bool,
         #[arg(long)]
         force: bool,
-        #[arg(long)]
-        typst: Option<String>,
         #[arg(long)]
         pdf: bool,
         /// Keep building remaining pages after a Typst compilation failure.
@@ -170,14 +167,12 @@ enum Command {
         #[arg(long)]
         no_hooks: bool,
     },
-    /// Generate a Typst bundle source and compile it with --format bundle.
+    /// Generate and compile a Typst bundle with the embedded compiler.
     Bundle {
         #[arg(long, default_value = ".")]
         root: PathBuf,
         #[arg(long)]
         drafts: bool,
-        #[arg(long)]
-        typst: Option<String>,
     },
     /// Generate deployment configuration scaffolds.
     Deploy {
@@ -347,20 +342,15 @@ fn main() -> Result<()> {
             date,
             draft,
         } => build::new_page(root, path, title, date, draft),
-        Command::Doctor {
-            root,
-            typst,
-            drafts,
-        } => build::doctor(root, typst, drafts),
+        Command::Doctor { root, drafts } => build::doctor(root, drafts),
         Command::Run { script, root, args } => run_script(root, script, args),
         Command::Dev { root } => run_script(root, Some("dev".to_string()), Vec::new()),
         Command::Preview { root } => run_script(root, Some("preview".to_string()), Vec::new()),
-        Command::Check { root } => build::doctor(root, None, false),
+        Command::Check { root } => build::doctor(root, false),
         Command::Build {
             root,
             drafts,
             force,
-            typst,
             pdf,
             keep_going,
             jobs,
@@ -375,7 +365,6 @@ fn main() -> Result<()> {
                 root: root.clone(),
                 drafts,
                 force,
-                typst_override: typst,
                 pdf,
                 keep_going,
                 jobs,
@@ -408,7 +397,6 @@ fn main() -> Result<()> {
                 root: root.clone(),
                 drafts,
                 force: false,
-                typst_override: None,
                 pdf,
                 keep_going: live_reload,
                 jobs,
@@ -424,11 +412,7 @@ fn main() -> Result<()> {
             }
             result
         }
-        Command::Bundle {
-            root,
-            drafts,
-            typst,
-        } => build::bundle_site(root, drafts, typst),
+        Command::Bundle { root, drafts } => build::bundle_site(root, drafts),
         Command::Deploy { command } => match command {
             DeployCommand::Init {
                 root,

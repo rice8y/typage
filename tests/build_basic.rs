@@ -2,39 +2,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-fn typst_available() -> bool {
-    let out = match Command::new("typst").arg("--version").output() {
-        Ok(out) if out.status.success() => out,
-        _ => return false,
-    };
-    let version = String::from_utf8(out.stdout)
-        .ok()
-        .and_then(|s| parse_typst_version(&s));
-    matches!(version, Some(version) if version >= (0, 15, 0))
-}
-
-fn parse_typst_version(output: &str) -> Option<(u64, u64, u64)> {
-    output.split_whitespace().find_map(|token| {
-        let token = token.strip_prefix('v').unwrap_or(token);
-        let mut parts = token.split('.');
-        let major = parse_version_component(parts.next()?)?;
-        let minor = parse_version_component(parts.next()?)?;
-        let patch = parse_version_component(parts.next()?)?;
-        Some((major, minor, patch))
-    })
-}
-
-fn parse_version_component(component: &str) -> Option<u64> {
-    let digits = component
-        .chars()
-        .take_while(|ch| ch.is_ascii_digit())
-        .collect::<String>();
-    if digits.is_empty() {
-        return None;
-    }
-    digits.parse().ok()
-}
-
 fn temp_project(name: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!("typage-{name}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&path);
@@ -46,11 +13,7 @@ fn assert_exists(path: &Path) {
 }
 
 #[test]
-fn init_and_build_basic_project_with_typst() {
-    if !typst_available() {
-        eprintln!("skipping integration test because typst is not available");
-        return;
-    }
+fn init_and_build_basic_project_with_embedded_typst() {
     let exe = env!("CARGO_BIN_EXE_typage");
     let project = temp_project("basic");
 
@@ -192,6 +155,7 @@ pages = ["projects/typshade.typ"]
     fs::write(project.join("config.toml"), config).unwrap();
 
     let build = Command::new(exe)
+        .env("PATH", "")
         .arg("build")
         .arg("--root")
         .arg(&project)
@@ -218,6 +182,7 @@ pages = ["projects/typshade.typ"]
     assert!(project_html.contains("GitHub"));
 
     let cached_build = Command::new(exe)
+        .env("PATH", "")
         .arg("build")
         .arg("--root")
         .arg(&project)
@@ -235,7 +200,9 @@ pages = ["projects/typshade.typ"]
     assert!(cached_stdout.contains("skip pdf document print.pdf"));
 
     let per_page_pdf = Command::new(exe)
+        .env("PATH", "")
         .arg("build")
+        .args(["--jobs", "1"])
         .arg("--root")
         .arg(&project)
         .arg("--pdf")
@@ -250,7 +217,50 @@ pages = ["projects/typshade.typ"]
     assert_exists(&project.join("public/posts/hello/index.pdf"));
     assert_exists(&project.join("public/print.pdf"));
 
+    let hello = project.join("content/posts/hello.typ");
+    let body = fs::read_to_string(&hello).unwrap();
+    fs::write(&hello, format!("{body}\nUpdated embedded build.\n")).unwrap();
+    let rebuild = Command::new(exe)
+        .env("PATH", "")
+        .env("NO_COLOR", "1")
+        .args(["build", "--explain"])
+        .arg("--root")
+        .arg(&project)
+        .output()
+        .unwrap();
+    assert!(
+        rebuild.status.success(),
+        "{}",
+        String::from_utf8_lossy(&rebuild.stderr)
+    );
+    assert!(
+        fs::read_to_string(project.join("public/posts/hello/index.html"))
+            .unwrap()
+            .contains("Updated embedded build.")
+    );
+    assert!(!String::from_utf8_lossy(&rebuild.stdout).contains("skip pdf document print.pdf"));
+
+    let bundle = Command::new(exe)
+        .env("PATH", "")
+        .arg("bundle")
+        .arg("--root")
+        .arg(&project)
+        .output()
+        .unwrap();
+    assert!(
+        bundle.status.success(),
+        "bundle failed\n{}",
+        String::from_utf8_lossy(&bundle.stderr)
+    );
+    assert!(
+        fs::read_to_string(project.join("public/posts/hello/index.html"))
+            .unwrap()
+            .contains("Updated embedded build.")
+    );
+    assert_exists(&project.join("public/style.css"));
+
     let doctor = Command::new(exe)
+        .env("PATH", "")
         .arg("doctor")
         .arg("--root")
         .arg(&project)

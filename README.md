@@ -1,852 +1,107 @@
 # Typage
 
-Typage is an experimental static site generator written in Rust and powered by Typst HTML Export.
+An experimental static site generator with Typst content and templates, powered by an embedded Typst compiler.
 
-The goal is to combine the safety and predictable output model of tools like Zola or Jekyll with a Typst-native authoring and templating experience.
-
-## Experimental Status
-
-Typage depends on Typst's HTML export, which is currently under active development and still incomplete. Typst HTML export is available only for experimentation behind a feature flag.
-
-**Do not use Typage or Typst HTML export for production use cases.** Expect breaking changes, missing HTML features, and output changes as Typst's exporter evolves.
-
-Typage enables experimental HTML export in its embedded compiler. Follow Typst's [HTML export tracking issue](https://github.com/typst/typst/issues/5512) for upstream progress and planned features.
+> **Do not use Typage for production use cases.**
+> Typst's HTML export is under active development and incomplete. Typage is experimental too; expect breaking changes and output changes. See the [upstream tracking issue](https://github.com/typst/typst/issues/5512).
 
 ## Requirements
 
-- Rust 1.92 or later and Cargo are required to install or build `typage`.
-- Typst 0.15.1 is embedded through Rust crates. No separate Typst CLI installation is required.
-- HTML builds require Typst's experimental HTML export. Typage enables it through `features = "html"` by default.
-- `typage bundle` uses the embedded experimental Bundle Export with `bundle_features = "bundle,html"` by default.
-- Building from source requires a native linker and, on Linux, OpenSSL development headers and `pkg-config` for HTTPS package downloads.
-
-### Embedded Compiler
-
-HTML, per-page PDF, combined print PDF, and bundle exports all run in-process. `typage doctor` reports the embedded compiler version. The old `--typst` option has been removed; remove `typst = "..."` from existing configuration files. The compiler version is selected by Typage's dependencies rather than an executable on `PATH`.
-
-System fonts and Typst's standard embedded fonts are available. Additional fonts can be supplied through `TYPST_FONT_PATHS` (an OS-separated path list). Set `TYPST_IGNORE_SYSTEM_FONTS=true` or `TYPST_IGNORE_EMBEDDED_FONTS=true` to disable the corresponding source. Generated `@local/typage` and `@local/typage-theme` packages take precedence over system packages. Other packages are loaded from the standard Typst data/cache directories or downloaded from Typst Universe when missing. Downloads require network access on the first build.
-
-`TYPST_PACKAGE_PATH`, `TYPST_PACKAGE_CACHE_PATH`, and `TYPST_CERT` customize package locations and the HTTPS certificate. Relative paths are resolved from the project root. `SOURCE_DATE_EPOCH` fixes Typst's current date and PDF creation timestamp for reproducible builds. Experimental features are configured with `features` and `bundle_features` in `config.toml`.
-
-Each compile job has its own sources and inputs; fonts and package loading are shared within a build. File reads are restricted to the project or the imported package's root, including symlink checks. Compiler upgrades invalidate the build cache. After changing installed fonts or external package contents, use `typage build --force`.
-
-## Philosophy
-
-- Treat `public/` as disposable generated output.
-- Detect broken links, invalid routes, and alias collisions early.
-- Keep content authoring in Typst.
-- Keep templates and reusable components in Typst.
-- Make the CLI feel familiar to users of npm-style project scripts.
-
-## Features
-
-- Build `content/**/*.typ` into `public/**/index.html`.
-- Typst-native metadata directives with `#show: page.with(...)` and `#show: project.with(...)`.
-- Collection schemas in `content/config.typ`.
-- External starters and presets through `typage init --starter` and `typage add`.
-- Legacy-compatible TOML front matter via `serde` and `toml`.
-- Per-page `template: "..."` selection.
-- Combined print PDF documents through `[[pdf_documents]]`.
-- Section metadata through `_index.typ`.
-- Section and taxonomy pagination through `paginate_by`.
-- Sorting through `sort_by`.
-- Content fields such as `updated`, `weight`, `expires`, plus schema-defined collection fields.
-- Permalink policies with `:section`, `:slug`, `:path`, `:filename`, `:year`, `:month`, and `:day`.
-- Stable page fields such as `kind`, `slug`, `path`, `file_path`, `canonical_url`, and `aliases`.
-- Nested sections with parent, children, ancestors, and siblings.
-- Configurable taxonomies such as tags, categories, or authors.
-- Internal links like `@/path/to/page.typ` and `@/path/to/page.typ#fragment`.
-- Broken internal link detection.
-- URL and alias path traversal rejection.
-- Page, generated URL, and alias collision detection.
-- Table of contents generation from headings.
-- Recursive dependency hashing for `#import`, `#include`, `read(...)`, and `image(...)`.
-- Incremental build cache.
-- Isolated wrappers under `.typage/wrappers/`.
-- Stale output cleanup.
-- Alias redirect page generation.
-- Optional RSS, Atom, sitemap, and robots outputs.
-- Canonical URL, Open Graph, and Twitter Card metadata in default templates.
-- Full-text `search_index.json` with field scores, heading entries, and CJK-friendly tokenization.
-- Theme-owned Typst components through `@local/typage-theme:0.1.5`.
-- Built-in shortcodes: `note`, `figure`, and `youtube`.
-- External generator plugins through `typage plugin`.
-- `serve --live-reload`.
-- Threaded development server with read/write timeouts.
-- Streamed static file responses for large assets.
-- ETag and 304 responses for cacheable dev-server files.
-- Changed-only static asset copying.
-- Parallel Typst compile jobs through `jobs = 0` or `--jobs`.
-- Job-local page context through Typst's `sys.inputs` dictionary.
-- `doctor`, `new`, `theme new`, `theme list --verbose`, `theme info`, and `theme check`.
-- `plugin install`, `plugin list`, `plugin doctor`, and `plugin run`.
-- Deployment scaffolds for GitHub Pages, Cloudflare Pages, Netlify, and Vercel.
-- `run` scripts plus `dev`, `preview`, and `check` aliases.
-- Generated local Typst packages `@local/typage:0.1.5` and `@local/typage-theme:0.1.5`.
-- Section-local previous and next navigation.
-- HTML/PDF dual-target helpers using `context { ... target() ... }`.
-- Unit tests and embedded-compiler integration tests, including builds without a Typst executable on `PATH`.
+- Rust 1.92 or later, Cargo, and a native linker to build or install Typage.
+- On Linux, OpenSSL development headers and `pkg-config` for HTTPS package downloads.
 
 ## Quick Start
 
-```sh
-cargo install --path .
+Install from this repository:
 
+```sh
+cargo install --git https://github.com/rice8y/typage --locked
 typage init my-site
 cd my-site
 typage dev
 ```
 
-`typage init` creates a small general-purpose starter: a home page, an about page, a posts section with one sample article, Typst templates, theme component files, and one stylesheet. It is meant to feel closer to an Astro or Jekyll starter than a blank page, while staying easy to delete or reshape.
+For a local checkout, use `cargo install --path . --locked`.
 
-Use an external starter when you want a domain-specific project shape:
-
-```sh
-typage init my-docs --starter github:rice8y/typage-starter-typst-docs --install-plugins
-```
-
-Equivalent npm-like form:
-
-```sh
-typage run dev
-```
-
-## Starter Layout
+The starter includes a home page, an about page, a posts collection, templates, and a stylesheet. Feeds, search, and taxonomies are opt-in.
 
 ```text
-typage/
-|-- config.toml
-|-- content/
-|   |-- config.typ
-|   |-- index.typ
-|   |-- about.typ
-|   `-- posts/
-|       |-- _index.typ
-|       `-- hello.typ
-|-- templates/
-|   |-- base.typ
-|   |-- list.typ
-|   |-- print.typ
-|   |-- helpers.typ
-|   `-- components/
-|-- static/
-|   `-- style.css
-`-- themes/              # created only when you run `typage theme new ...`
+config.toml    Site configuration
+content/       Typst pages and collection schemas
+templates/     Page, list, and print templates
+static/        Assets copied as-is
+public/        Generated site
+.typage/       Build cache and generated packages
 ```
 
-The starter includes navigation, a posts collection, a reusable base layout, and a reusable list layout. Search, taxonomies, feeds, and deploy scaffolds remain opt-in so the generated site stays small until you need those features.
+Treat `public/` and `.typage/` as disposable. Keep source files and assets outside them.
 
-## Starters And Presets
+## Write Content
 
-Starters are file bundles that can also register plugins. They are meant for templates, static assets, theme files, content schemas, and project presets. Because these files are mostly Typage, Typst, CSS, and static assets, they are usually better distributed as Git repositories than as crates.io packages.
-
-Create a project from a starter:
+Create a page:
 
 ```sh
-typage init my-docs --starter github:rice8y/typage-starter-typst-docs --install-plugins
-typage init my-docs --starter https://github.com/rice8y/typage-starter-typst-docs.git
-typage init my-docs --starter ../typage-starter-typst-docs
+typage new posts/first-post --title "Hello"
 ```
 
-Apply a starter or preset to an existing project:
-
-```sh
-typage add github:rice8y/typage-starter-typst-docs --install-plugins
-typage add ../typage-starter-typst-docs --force
-```
-
-Starter repositories can place project files under `files/` and describe plugin registrations in `typage.starter.toml`:
-
-```toml
-name = "typst-docs"
-description = "Typst package API documentation starter."
-min_typage = "0.1.5"
-
-[plugins.typst_docs]
-package = "typage-plugin-typst-docs"
-version = "0.1.0"
-watch = ["package/**/*.typ", "package/typst.toml"]
-outputs = ["content/api"]
-
-[plugins.typst_docs.config]
-source_dir = "package"
-out_dir = "content/api"
-template = "typst-docs.typ"
-```
-
-The `files/` directory is copied into the project root. Existing files are not overwritten unless `--force` is passed. Plugin registrations are merged into `typage.plugins.toml`; `--install-plugins` also installs declared plugin binaries with Cargo when the plugin entry does not use `command`.
-
-Supported starter sources:
-
-```text
-github:owner/repo
-github:owner/repo#tag-or-branch
-https://github.com/owner/repo.git
-git+https://github.com/owner/repo.git
-../local-starter
-```
-
-## Content Model
-
-Pages declare build metadata with a Typst-native directive. Typage reads the directive as metadata, removes it from the body before compiling, and passes schema-defined fields to templates as first-class page fields:
+Edit `content/posts/first-post.typ`:
 
 ```typst
 #show: page.with(
   title: "Hello",
-  description: "A first post",
-  date: "2026-06-23",
-  updated: "2026-06-24",
-  weight: 10,
-  expires: "2027-01-01",
-  draft: false,
+  description: "My first post.",
 )
+
+= Welcome
+
+Written in Typst, published as HTML.
 ```
 
-Project-like pages can use the alias `project.with(...)` and define collection-specific fields:
+Typage reads and removes the metadata directive before compilation; no import is required. `project.with(...)` is an alias. Define collection-specific fields in `content/config.typ`. TOML front matter remains supported for legacy content.
 
-```typst
-#show: project.with(
-  title: "typshade",
-  description: "A Typst package for visualizing multiple-sequence alignments in bioinformatics.",
-  date: "2026-05-23",
-  updated: "2026-06-30",
-  languages: ("Typst",),
-  links: (
-    (label: "GitHub", url: "https://github.com/rice8y/typshade"),
-    (label: "Typst Universe", url: "https://typst.app/universe/package/typshade/"),
-  ),
-)
-```
+By default, `content/posts/first-post.typ` becomes `/posts/first-post/`. See [Content](docs/content.md) for schemas, routing, and publishing options.
 
-Declare collection schemas in `content/config.typ`:
-
-```typst
-#let collections = (
-  posts: collection.with(schema: (
-    title: str,
-    description: optional(str),
-    date: optional(datetime),
-    updated: optional(datetime),
-    draft: optional(bool),
-    tags: optional(array(str)),
-  )),
-  projects: collection.with(schema: (
-    title: str,
-    description: str,
-    publishedDate: optional(datetime),
-    updatedDate: optional(datetime),
-    demoURL: optional(url),
-    repoURL: optional(url),
-    languages: optional(array(str)),
-    links: optional(array(object((label: str, url: url)))),
-  )),
-)
-```
-
-Schema identifiers are Typage built-ins inside `content/config.typ`; no imports are required. They intentionally use Typst-like names such as `str`, `int`, `float`, `bool`, `datetime`, `array(...)`, `object(...)`, `optional(...)`, and `union(...)`. During page compilation Typage emits validation code that checks schema fields with Typst's `type(...)`.
-
-TOML front matter is still accepted for legacy content, but new pages generated by `typage new` use `#show: page.with(...)`. TOML `[extra]` is not supported; declare collection fields directly instead.
-
-By default, future-dated pages and expired pages are not built. Configure this when needed:
-
-```toml
-build_future = false
-build_expired = false
-```
-
-Nested directories become nested sections. For example, `content/posts/tutorials/intro.typ` belongs to section `posts/tutorials`.
-
-The generated site package exposes section data:
-
-```typst
-#import "@local/typage:0.1.5": current, section, children, ancestors, siblings
-
-#current.updated
-#current.weight
-#current.languages
-
-#section("posts/tutorials").pages
-#children("posts")
-#ancestors(current)
-#siblings(current)
-```
-
-## Permalinks
-
-By default, Typage uses directory URLs:
-
-```text
-content/index.typ             -> /
-content/posts/hello.typ       -> /posts/hello/
-content/posts/index.typ       -> /posts/
-```
-
-You can opt into a global permalink policy in `config.toml`:
-
-```toml
-permalink = "/:section/:slug/"
-```
-
-Supported placeholders:
-
-```text
-:section   page section, for example posts/tutorials
-:slug      page slug from metadata or filename
-:path      source path without extension, for example posts/hello
-:filename  file stem, for example hello
-:year      YYYY from date
-:month     MM from date
-:day       DD from date
-```
-
-A page can override the global policy:
-
-```typst
-#show: page.with(
-  title: "Release Note",
-  date: "2026-06-24",
-  slug: "v0-23",
-  path: "/releases/:year/:slug/",
-  aliases: ("old/release-note",),
-)
-```
-
-Generated page objects expose stable routing fields:
-
-```typst
-#current.kind
-#current.slug
-#current.path
-#current.file_path
-#current.url
-#current.canonical_url
-#current.aliases
-```
-
-Alias pages are generated as redirects to `canonical_url`.
-
-## Typst-Native Components
-
-Components are theme-owned. The SSG core only exposes data, routing, URL helpers, and the active theme component package.
-
-Use the core package for site data:
-
-```typst
-#import "@local/typage:0.1.5": site, current, section, taxonomy-url
-```
-
-Use the active theme package for UI components:
-
-```typst
-#import "@local/typage-theme:0.1.5": note, callout, card, fig, youtube, page-link, taxonomy-link
-
-#note(title: "Note")[
-  This component comes from the active theme.
-]
-
-#callout(kind: "warning", title: "Warning")[
-  This becomes theme-defined HTML/PDF output.
-]
-
-#card(title: "Card", href: "/posts/hello/")[
-  Linkable card content.
-]
-
-#fig(src: "/images/demo.png", alt: "Demo", caption: "A demo image")
-
-#youtube("dQw4w9WgXcQ", title: "Demo video")
-```
-
-The old shortcode syntax remains available as an optional convenience layer:
-
-```typst
-{{ note(text="A short note") }}
-{{ figure(src="images/demo.png", alt="Demo", caption="A demo figure") }}
-{{ youtube(id="dQw4w9WgXcQ", title="Demo video") }}
-```
-
-## Theme Management
-
-Themes live under `themes/<name>/`. A theme can provide `templates/`, `templates/components/`, `static/`, and `theme.toml`.
+## Build and Export
 
 ```sh
-typage theme new my-theme
-typage theme list
-typage theme list --verbose
-typage theme info my-theme
-typage theme check my-theme
+typage dev             # Serve with live reload
+typage doctor          # Check configuration, routes, and links
+typage build           # Build into public/
+typage build --pdf     # Also create per-page PDFs
+typage build --force   # Rebuild all outputs
 ```
 
-Enable a theme:
-
-```toml
-theme = "my-theme"
-```
-
-`theme.toml` schema:
-
-```toml
-name = "my-theme"
-version = "0.1.0"
-description = "A typage theme."
-min_typage = "0.1.5"
-
-[components]
-note = true
-callout = true
-card = true
-fig = true
-youtube = true
-page_link = true
-taxonomy_link = true
-
-[extra]
-accent = "#2563eb"
-```
-
-`theme check` validates that:
-
-```text
-- theme.toml exists and parses
-- min_typage is compatible with the current typage version
-- templates/ exists
-- templates/components/lib.typ exists
-- components declared as true appear to be exported by lib.typ
-```
-
-Component convention:
-
-```text
-templates/components/
-|-- lib.typ       # entrypoint for @local/typage-theme:0.1.5
-|-- callout.typ
-|-- card.typ
-|-- media.typ
-`-- layout.typ
-```
-
-`typage` copies the active `templates/components/` directory into the generated package `@local/typage-theme:0.1.5`. Project `static/` overrides theme `static/` when both provide the same path.
-
-## Plugins
-
-Plugins are external executables that can generate or update Typage project files before the normal content discovery step. This keeps Typage as the single CLI entrypoint while allowing domain-specific generators, such as a Typst package API documentation generator, to ship independently.
-
-Install and register a plugin:
-
-```sh
-typage plugin install typst-docs
-typage plugin install typst-docs --git https://github.com/rice8y/typage-plugin-typst-docs
-typage plugin install typst-docs --path ../typage-plugin-typst-docs
-typage plugin install typst-docs --command ../tools/typage-plugin-typst-docs
-```
-
-By default, `typage plugin install typst-docs` runs:
-
-```sh
-cargo install typage-plugin-typst-docs --locked
-```
-
-`--git` and `--path` switch the Cargo install source. `--command` skips Cargo and registers an existing executable. The registration is written to `typage.plugins.toml`, which is intended to be committed with the project.
-
-Example registration:
-
-```toml
-[plugins.typst_docs]
-package = "typage-plugin-typst-docs"
-version = "0.1.0"
-watch = ["packages/demo/**/*.typ"]
-outputs = ["content/api"]
-
-[plugins.typst_docs.config]
-source_dir = "packages/demo"
-out_dir = "content/api"
-```
-
-Plugin entries may also live directly in `config.toml` under `[plugins.<name>]`. If both files define the same plugin name, `typage.plugins.toml` wins.
-
-During `typage build`, each enabled plugin is invoked before Typage reads `content/`:
-
-```sh
-<plugin-command> generate --root <project-root> --name <plugin-name>
-```
-
-Typage also sets `TYPAGE_ROOT`, `TYPAGE_PLUGIN_NAME`, and `TYPAGE_PLUGIN_CONFIG_JSON`. `plugin.args` are appended after the generated command arguments. `watch` paths are watched by `typage watch` and `typage serve --live-reload`; they must be project-relative paths.
-
-Plugin doctor checks run:
-
-```sh
-<plugin-command> manifest --json
-```
-
-The manifest must print valid JSON. Typage does not install plugins automatically during build, serve, or deploy; install the plugin binary explicitly in local development and CI.
-
-## Site API
-
-`@local/typage:0.1.5` exposes data and non-presentational helpers for content and templates:
-
-```typst
-#import "@local/typage:0.1.5": site, current, pages, sections, taxonomies, url, asset, section, children, ancestors, siblings, taxonomy-url, is-current, page-by-url
-#import "@local/typage-theme:0.1.5": page-link, taxonomy-link
-
-= #current.title
-
-#for page in section("posts").pages [
-  - #page-link(page)
-]
-
-Tags: #taxonomy-link("tags", "typst")
-```
-
-Core helpers:
-
-```text
-url(path)              prepend site.base_url when configured
-asset(path)            alias of url(path)
-section(name)          return section data
-children(section)      child sections for a section name or section dictionary
-ancestors(item)        ancestor sections for a section name, section dictionary, or page
-siblings(page)         pages in the same section except the given page
-page-by-url(url)       find a page by URL or none
-taxonomy-url(name, term)
-is-current(page)
-```
-
-Presentational helpers such as `page-link`, `taxonomy-link`, `note`, `card`, and media embeds belong to `@local/typage-theme:0.1.5`.
-
-## Directory Policy
-
-Default layout:
-
-```text
-content/     Typst source pages
-templates/   Typst templates
-static/      Static files copied as-is
-public/      Generated site output
-.typage/     Cache, wrappers, and generated local packages
-```
-
-`public/` is disposable. Do not edit it manually. Put manually maintained assets in `static/` or the active theme's `static/`.
-
-If you prefer npm/Vite-like naming, use configuration instead of a different init layout:
-
-```toml
-static_dir = "public"
-out_dir = "dist"
-```
-
-`doctor` and `build` reject dangerous layouts such as `out_dir == static_dir`, `out_dir` inside `content_dir`, or `out_dir` containing source/cache directories.
-
-## Publishing Metadata
-
-When feeds are enabled, Typage writes RSS and, by default, Atom feeds:
-
-```text
-/feed.xml
-/atom.xml
-```
-
-Feed output is configurable:
-
-```toml
-feed = true
-feed_path = "rss.xml"
-feed_sections = ["posts", "projects"]
-feed_limit = 0
-atom_feed = false
-
-[[feeds]]
-path = "projects/rss.xml"
-title = "Project Feed"
-description = "Project updates."
-link = "/projects/"
-section = "projects"
-limit = 0
-```
-
-`feed_limit = 0` means unlimited items. `feed_sections` filters the primary RSS and Atom feeds, while each `[[feeds]]` entry can target a single `section` or a `sections` list.
-
-If `base_url` is empty, feed links are emitted as site-root-relative URLs. Set `base_url` before publishing when you need absolute feed item links. Typage can also write a sitemap and robots file:
-
-```text
-/sitemap.xml
-/robots.txt
-```
-
-Default templates emit:
-
-```text
-<link rel="canonical" ...>
-og:title / og:type / og:url / og:description
-twitter:card / twitter:title / twitter:description
-article:published_time for dated pages
-```
-
-## Search
-
-When search is enabled, Typage emits `public/search_index.json`. The minimal starter keeps search disabled; add a search page and client script when you want site search.
-
-Suggested optional layout:
-
-```text
-content/search.typ
-static/search.js
-```
-
-The old boolean form remains supported:
-
-```toml
-search = true
-```
-
-For real sites, prefer the table form:
-
-```toml
-[search]
-enabled = true
-mode = "auto"      # auto | latin | cjk | ngram | ngram-only
-ngram = 2          # useful for CJK text
-include_body = true
-include_headings = true
-include_tags = true
-include_taxonomies = true
-compact = false    # true omits full body text from the JSON index
-max_tokens = 2048
-```
-
-Search entries include:
-
-```text
-title / url / description / excerpt
-tokens
-headings[] with heading-local tokens
-fields.title / fields.headings / fields.body / fields.taxonomies
-```
-
-## Build Output and Profiling
-
-Default output is compact and colored. Use `NO_COLOR=1` to disable ANSI colors.
-
-```sh
-typage build --force --jobs 4 --profile
-typage build --force --jobs 4 --verbose
-typage build --explain
-typage build --quiet
-```
-
-`--profile` prints compile wall time, sum of per-job Typst times, and the slowest pages. `--verbose` prints each compiled page. `--explain` prints why each item is rebuilt or skipped and reports unresolved local dependencies.
-
-## Print PDF / Combined PDF Export
-
-`typage build --pdf` writes one `index.pdf` next to each built content page.
-
-Use `[[pdf_documents]]` when you want one PDF that combines multiple content pages into a print document:
+To combine pages into a single PDF, add this to `config.toml`:
 
 ```toml
 [[pdf_documents]]
 path = "print.pdf"
-title = "r-Portfolio"
-description = "Print version of r-Portfolio."
+title = "My Site"
 template = "print.typ"
-sections = ["blog", "projects"]
+sections = ["posts"]
 sort_by = "date_desc"
-section_headings = ["blog", "projects"]
-section_heading_level = 1
-include_drafts = false
-include_future = false
-include_expired = false
-
-[[pdf_documents]]
-path = "projects.pdf"
-title = "Projects"
-template = "print.typ"
-pages = ["projects/typage.typ", "/projects/typshade/"]
 ```
 
-`path` is a PDF path relative to `out_dir`. `template` is resolved relative to `templates_dir`. `sections` selects content pages by section, while `pages` can explicitly list source paths, Typage content paths, or page URLs. Explicit `pages` keep their listed order; section-selected pages use the same `sort_by` vocabulary as section lists.
+A normal `typage build` then produces `public/print.pdf` using the starter's print template. See [Building and PDF Export](docs/building.md) for custom print templates, compiler settings, caching, and profiling.
 
-Set `section_headings` to insert section-level headings before pages from those sections. Those generated section headings use `section_heading_level`, and page titles in those sections are emitted one level deeper. For example, `section_headings = ["blog", "projects"]` makes `Blog` and `Projects` level-1 headings while individual post and project titles become level-2 headings.
+## Extend and Deploy
 
-Combined print PDFs are generated during `typage build`, served like any other file from `public/`, and participate in the incremental cache, `--force`, `--explain`, stale output cleanup, and `doctor` validation.
+Use `typage init my-site --starter github:owner/repo` for an external starter, or `typage add` to apply one to an existing project. Themes provide templates and components; plugins generate content before the build.
 
-A minimal `templates/print.typ`:
+Generate hosting configuration with `typage deploy init <target>`, where `<target>` is `github-pages`, `cloudflare-pages`, `netlify`, or `vercel`. Typage generates deployment files; the hosting platform publishes the site.
 
-```typst
-#let render(site: (:), document: (:), pages: (), body) = {
-  set page(numbering: "1")
+## Documentation
 
-  align(center)[
-    #text(size: 24pt, weight: "bold")[#document.title]
-  ]
+| Guide | Topics |
+| --- | --- |
+| [Content](docs/content.md) | Metadata, schemas, permalinks, feeds, search |
+| [Templates and Themes](docs/templates.md) | Components, theme configuration, site API |
+| [Starters and Plugins](docs/extensions.md) | Starter manifests, plugin installation and protocol |
+| [Building and PDF Export](docs/building.md) | Compiler settings, PDFs, parallel builds, scripts, hooks |
+| [Deployment](docs/deployment.md) | Hosting scaffolds and CI setup |
 
-  pagebreak()
-  outline()
-  pagebreak()
-
-  body
-}
-```
-
-Typage calls `render` with `site`, `document`, selected page metadata, and `body`. The generated `body` contains the selected content pages in order, with a local `page` variable available for each page block. Typage sets the PDF document title before calling `render`; inside the template, use `document.title` for visible text. HTML-only content or templates that call `html.elem(...)` must guard those calls with `target() == "html"` or provide a PDF fallback.
-
-## Parallel Compile
-
-`jobs = 0` uses available CPU parallelism. You can also override it from the CLI:
-
-```toml
-jobs = 0 # auto
-```
-
-```sh
-typage build --jobs 4
-typage run dev -- --jobs 4
-typage serve --live-reload --jobs 4
-typage build --jobs 1
-```
-
-`current` is passed through the job's `sys.inputs.typage_current` JSON value (or a generated metadata file for large values), so each compile job has independent page context. Fonts and package resolution are shared across jobs.
-
-## Scripts
-
-`config.toml` can define scripts:
-
-```toml
-[scripts]
-build = "build"
-dev = "serve --live-reload"
-preview = "serve"
-check = "doctor"
-clean = "clean"
-```
-
-Run them:
-
-```sh
-typage run
-typage run dev
-typage run build -- --force
-typage run check
-```
-
-Convenience aliases:
-
-```sh
-typage dev      # run dev
-typage preview  # run preview
-typage check    # doctor
-```
-
-## Hooks
-
-Typage can run command hooks around build, serve, and deploy operations. Hooks are configured in `config.toml` and run from the site root.
-
-```toml
-[hooks]
-pre_build = "echo before build"
-post_build = "echo after build"
-pre_serve = "echo before serve"
-post_serve = "echo after serve"
-pre_deploy = "echo before deploy"
-post_deploy = "echo after deploy"
-```
-
-Hooks may call external commands or `typage ...`. Nested Typage commands launched from hooks do not trigger hooks again, which avoids accidental recursive hooks. Use `--no-hooks` when you want to bypass hooks explicitly.
-
-```sh
-typage build --no-hooks
-typage serve --no-hooks
-typage deploy init vercel --no-hooks
-```
-
-## Commands
-
-```sh
-typage build
-typage build --force
-typage build --pdf
-typage build --keep-going
-typage init my-docs --starter github:owner/starter
-typage add github:owner/starter
-typage dev
-typage serve --live-reload
-typage preview
-typage bundle
-typage doctor
-typage check
-typage plugin list
-typage plugin doctor
-typage clean
-```
-
-Create a new page:
-
-```sh
-typage new posts/my-post --title "My Post" --date 2026-06-23
-```
-
-Create a theme skeleton:
-
-```sh
-typage theme new my-theme
-```
-
-Enable it in `config.toml`:
-
-```toml
-theme = "my-theme"
-```
-
-## Deployment Scaffolds
-
-Typage does not upload files by itself. It writes files that common hosting platforms expect:
-
-```sh
-typage deploy init github-pages --cname example.com
-typage deploy init cloudflare-pages
-typage deploy init netlify
-typage deploy init vercel
-```
-
-Check deployment files:
-
-```sh
-typage deploy doctor
-typage deploy doctor --target github-pages
-```
-
-Generated files:
-
-```text
-GitHub Pages:
-  .github/workflows/deploy.yml
-  static/.nojekyll
-  static/CNAME        # only when --cname is passed
-
-Cloudflare Pages:
-  wrangler.toml
-
-Netlify:
-  netlify.toml
-
-Vercel:
-  vercel.json
-```
-
-Because `public/` is disposable, files that must appear in deployed output are written to `static/` when appropriate. For example, GitHub Pages uses `static/.nojekyll` and `static/CNAME`, which are copied into `public/` during build.
-
-If a scaffold already exists, Typage refuses to overwrite it. Use `--force` when you intentionally want to regenerate it.
-
-Generated deploy scaffolds install Typage with `cargo install typage --locked` before running `typage build`. Typage includes the compiler, so a separate Typst installation is unnecessary. Regenerate existing scaffolds with `typage deploy init <target> --force` to remove the old Typst CLI installation steps.
-
-During local development, adjust `cargo install typage --locked` to `cargo install --path .` or `cargo install --git https://github.com/rice8y/typage` as needed.
-
-## Notes
-
-`@local/typage:0.1.5` and `@local/typage-theme:0.1.5` are staged under `.typage/packages/local/` and resolved by the embedded compiler's package loader.
-
-Typst HTML Export and Bundle Export are experimental. Typage is designed with that moving target in mind.
+Run `typage --help` or `typage <command> --help` for command options. See [config.toml](config.toml) for configuration examples.
 
 ## License
 
-Typage is licensed under the MIT License. See [LICENSE](LICENSE) for details.
-
-Dependencies are governed by their own licenses.
+This project is distributed under the MIT License. See [LICENSE](LICENSE) for details.
